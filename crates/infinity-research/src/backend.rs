@@ -179,7 +179,7 @@ impl PythonBackend {
                     .ok_or_else(|| "campaign wall timeout is too large".into())
             }
             "context" | "finding" | "candidate" | "reserve_model_call" | "record_usage"
-            | "heartbeat" => Ok(self.control_timeout),
+            | "heartbeat" | "interrupt_tool" => Ok(self.control_timeout),
             _ => Err(format!("unsupported research operation: {operation}").into()),
         }
     }

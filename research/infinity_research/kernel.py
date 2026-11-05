@@ -278,6 +278,14 @@ class GenericStore:
         result["result"] = json.loads(result["result"]) if result["result"] is not None else None
         result["depends_on"] = [r[0] for r in db.execute("SELECT depends_on FROM dependencies WHERE work_id=? ORDER BY depends_on",
                                                        (row["id"],))]
+        # A crash may happen after an effect commits but before complete_work
+        # cites it. Discover every attempt's receipts without relying on the
+        # previous model conversation or treating them as accepted conclusions.
+        result["effect_count"] = db.execute("SELECT COUNT(*) FROM effects WHERE work_id=?", (row["id"],)).fetchone()[0]
+        recent = db.execute("""SELECT id,capability,state,attempt,created,finished,
+            (result IS NOT NULL) AS result_available FROM effects WHERE work_id=?
+            ORDER BY created DESC,id DESC LIMIT 8""", (row["id"],)).fetchall()
+        result["recent_effects"] = [self._effect_summary(effect) for effect in recent]
         result["result_status"] = "agent_authored_not_independently_verified"
         if owner is None or row["lease_owner"] != owner:
             result.pop("lease_token")
@@ -567,6 +575,63 @@ class GenericStore:
             if row is None:
                 raise ValueError("Unknown effect")
             return self._effect(row)
+
+    @staticmethod
+    def _effect_summary(row) -> dict:
+        summary = dict(row)
+        summary["result_available"] = bool(summary["result_available"])
+        summary["result_status"] = "host_tool_output"
+        return summary
+
+    def list_effects(self, work_id: str, *, after_id: str | None = None,
+                     limit: int = 25) -> dict:
+        """Discover a work item's receipts, including ones not yet cited.
+
+        Only bounded metadata is returned. Use effect(id) for the original
+        arguments, exact result and hashes after choosing a relevant receipt.
+        """
+        _text(work_id, "work_id", 100)
+        if after_id is not None:
+            _text(after_id, "after_id", 100)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("list_effects limit must be an integer in 1..100")
+        with self._db(True) as db:
+            self._refresh(db)
+            self._row(db, work_id)
+            after = " AND id>?" if after_id is not None else ""
+            values = [work_id, after_id, limit + 1] if after_id is not None else [work_id, limit + 1]
+            rows = db.execute("""SELECT id,capability,state,attempt,created,finished,
+                (result IS NOT NULL) AS result_available FROM effects WHERE work_id=?"""
+                              + after + " ORDER BY id LIMIT ?", values).fetchall()
+            return {"items": [self._effect_summary(row) for row in rows[:limit]],
+                    "next_cursor": rows[limit - 1]["id"] if len(rows) > limit else None}
+
+    def interrupt_effect(self, owner: str, request_key: str, reason: str) -> dict:
+        """Host-only fencing after a tool RPC exits without a usable response.
+
+        Worker heartbeats can legitimately keep the parent work alive while a
+        tool RPC is lost. Fence that one effect explicitly so its slot does not
+        remain reserved for the lifetime of a healthy worker. The caller must
+        first stop/lose the RPC; interruption records an unknown outcome and
+        does not assert that a remote side effect never happened.
+        """
+        self._identity(owner, request_key)
+        _text(reason, "interruption reason", 8000)
+        with self._db(True) as db:
+            self._refresh(db)
+            row = db.execute("SELECT * FROM effects WHERE request_key=?", (request_key,)).fetchone()
+            if row is None:
+                return {"found": False, "interrupted": False}
+            if row["owner"] != owner:
+                raise RuntimeError("Effect request belongs to another owner")
+            interrupted = row["state"] == "running"
+            if interrupted:
+                db.execute("UPDATE effects SET state='interrupted',finished=?,error=? WHERE id=?",
+                           (time.time(), "Tool RPC interrupted; outcome is unknown: " + reason, row["id"]))
+                self._event(db, "effect_interrupted", {"effect_id": row["id"], "work_id": row["work_id"],
+                                                       "reason": reason})
+                row = db.execute("SELECT * FROM effects WHERE id=?", (row["id"],)).fetchone()
+            return {"found": True, "interrupted": interrupted, "effect": self._effect(row)}
 
     def reserve_model_call(self, request_id: str) -> dict:
         _text(request_id, "request_id", 300)

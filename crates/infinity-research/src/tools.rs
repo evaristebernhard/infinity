@@ -1,8 +1,8 @@
 //! Research operations registered as real asynchronous Infinity tools.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use infinity_agent_core::message::{InputMessage, InputMessageContent};
@@ -21,6 +21,7 @@ use crate::{BoxError, ResearchBackend};
 pub struct ToolActivity {
     active: AtomicUsize,
     completed: AtomicU64,
+    failure: Mutex<Option<String>>,
 }
 
 impl ToolActivity {
@@ -32,6 +33,21 @@ impl ToolActivity {
     /// Completed backend operations, including reported failures.
     pub fn completed(&self) -> u64 {
         self.completed.load(Ordering::SeqCst)
+    }
+
+    /// A failed host recovery must stop inference instead of retrying forever.
+    pub fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .expect("bug: tool failure state poisoned")
+            .clone()
+    }
+
+    fn fail(&self, reason: String) {
+        self.failure
+            .lock()
+            .expect("bug: tool failure state poisoned")
+            .get_or_insert(reason);
     }
 }
 
@@ -168,14 +184,40 @@ fn start_operation(
 ) {
     let sender = context.message_sender.clone();
     let group_id = context.group_id.clone();
-    let guard = ActivityGuard::new(activity);
+    let guard = ActivityGuard::new(activity.clone());
     tokio::spawn(async move {
         let _guard = guard;
+        let interrupted_request = (operation == "invoke_tool").then(|| {
+            json!({
+                "owner": arguments["owner"], "request_key": arguments["request_key"],
+            })
+        });
         let response = match backend.call(operation, arguments).await {
             Ok(result) => json!({"ok": true, "result": result}),
             Err(error) => {
                 tracing::warn!(%group_id, operation, %error, "research operation failed");
-                json!({"ok": false, "error": error.to_string()})
+                let mut response = json!({"ok": false, "error": error.to_string()});
+                if let Some(mut request) = interrupted_request {
+                    request["reason"] =
+                        Value::String(error.to_string().chars().take(4000).collect());
+                    // The RPC may have died after reserving an effect. A live
+                    // model owner still gets heartbeats, so work-lease expiry
+                    // alone cannot recover that orphan. Preserve a host-owned
+                    // unknown receipt before permitting another tool attempt.
+                    match backend.call("interrupt_tool", request).await {
+                        Ok(recovery) => {
+                            response["recovery"] = recovery;
+                        }
+                        Err(recovery_error) => {
+                            let message =
+                                format!("cannot recover interrupted tool: {recovery_error}");
+                            tracing::error!(%group_id, %message);
+                            activity.fail(message.clone());
+                            response["recovery_error"] = Value::String(message);
+                        }
+                    }
+                }
+                response
             }
         };
         let message = InputMessage {

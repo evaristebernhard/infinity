@@ -113,9 +113,17 @@ ready work 时保持等待，不让 100 个 agent 每两秒互相报告“还没
 最多持有一个租约。模型调用、工作数量和并发工具数分别有界，这些是长时间运行
 的资源与故障控制，不承担价格优化目标。
 
-工具执行会续租。失败次数与执行次数分开：等待子任务、父任务重新领取，不会
+宿主给仍活跃的 native worker 续租，覆盖长模型推理；工具执行也会续租。
+失败次数与执行次数分开：等待子任务、父任务重新领取，不会
 被当作一次失败。租约过期可以重新派工，但旧 token 无法完成新一轮工作。
 已有工具调用的结果若因失联无法确定，会标为 `interrupted`，不会虚构成功。
+
+工具 RPC 断开而 worker 仍活着时，宿主主动登记中断，避免该调用被持续续租的
+任务永远保留。中断登记失败会让 launcher 报错停止。执行器报告清理失败时，
+也停止接纳新计算，保留诊断记录；普通程序错误仍可由 worker 修复重试。
+
+重领任务会带回最近的工具调用摘要。`list_effects` 可以查看所有旧尝试的记录，
+包括“工具已完成、任务尚未完成”时发生崩溃的情况；新 worker 可先读取旧产物。
 
 ## 4. 通用工具接口
 
@@ -128,7 +136,7 @@ Rust 的工具枚举加一个比赛名称。
 | --- | --- |
 | 工作图 | `create_work`、`claim_work`、`renew_work`、`wait_work`、`complete_work`、`fail_work`、`read_work`、`list_work` |
 | 状态与方法 | `research_context`、`list_skills`、`read_skill` |
-| 证据与产物 | `read_effect`、`read_artifact` |
+| 证据与产物 | `list_effects`、`read_effect`、`read_artifact` |
 | 通用执行 | `run_python` |
 | 当前几何特化 | `verify_square_packing` |
 

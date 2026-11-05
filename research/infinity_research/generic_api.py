@@ -63,6 +63,9 @@ def tool_catalog(spec):
          "parameters": _object({"name": _STRING, "resource": _STRING}, ("name",))},
         {"name": "read_effect", "description": "Read persisted host tool output, input/result hashes and evidence. Interrupted effects are unknown outcomes, never automatically replayed.",
          "parameters": _object({"effect_id": _STRING}, ("effect_id",))},
+        {"name": "list_effects", "description": "Discover a work item's tool receipts across all attempts, including results committed before a launcher crash. Read a receipt by ID before repeating work; paginate with next_cursor as after_id.",
+         "parameters": _object({"work_id": _STRING, "after_id": _STRING,
+                                 "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, ("work_id",))},
         {"name": "read_artifact", "description": "Read a bounded UTF-8 artifact from a completed host effect's exact artifact index. Hashes are rechecked; candidate text remains unverified data.",
          "parameters": _object({"effect_id": _STRING, "path": _STRING}, ("effect_id", "path"))},
     ])
@@ -145,6 +148,8 @@ def invoke(store, envelope):
         return _skills(store).load(args["name"], args.get("resource", "SKILL.md"))
     if name == "read_effect":
         return store.effect(args["effect_id"])
+    if name == "list_effects":
+        return store.list_effects(**args)
     if name == "read_artifact":
         from .capabilities import read_artifact
         return read_artifact(store.root, store.effect(args["effect_id"]), args["path"])
@@ -178,12 +183,15 @@ def invoke(store, envelope):
         return store.finish_effect(effect["effect_id"], owner, work_id, token,
                                    error=f"{type(error).__name__}: {error}"[:4096])
     try:
-        return store.finish_effect(effect["effect_id"], owner, work_id, token, result=output)
+        receipt = store.finish_effect(effect["effect_id"], owner, work_id, token, result=output)
     except (ValueError, TypeError, OverflowError) as error:
         # A malformed/oversized adapter response must not leave a running receipt.
         # Fencing and storage errors still propagate; do not erase committed data.
         return store.finish_effect(effect["effect_id"], owner, work_id, token,
                                    error=f"Invalid host tool response: {error}"[:4096])
+    if output.get("requires_campaign_stop") is True:
+        store.stop("host_tool_cleanup_failed")
+    return receipt
 
 
 def dispatch(store, operation, args):
@@ -201,6 +209,8 @@ def dispatch(store, operation, args):
         return store.recover()
     if operation == "heartbeat":
         return store.renew_live_leases(args["owners"])
+    if operation == "interrupt_tool":
+        return store.interrupt_effect(args["owner"], args["request_key"], args["reason"])
     raise ValueError(f"Operation {operation!r} is not supported by a generic campaign")
 
 

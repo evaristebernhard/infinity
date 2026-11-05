@@ -266,6 +266,67 @@ class KernelTests(unittest.TestCase):
                                          result={"judgement": "verified"})
         self.assertEqual(self.store.effect(started["effect_id"])["state"], "interrupted")
 
+    def test_host_interrupt_releases_orphaned_tool_even_while_worker_heartbeats(self):
+        self.store = GenericStore.create(Path(self.tmp.name) / "one-tool-slot", contract(max_parallel_tools=1))
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "lost-rpc")
+        with self.assertRaisesRegex(RuntimeError, "capacity busy"):
+            self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "next-rpc")
+        with patch("infinity_research.kernel.time.time", return_value=lease["lease_expires"] - 1):
+            self.assertEqual(self.store.renew_live_leases(["worker-1"])["renewed"], 1)
+        with patch("infinity_research.kernel.time.time", return_value=lease["lease_expires"] + 1):
+            self.assertEqual(self.store.context()["active_tools"], 1)
+            interrupted = self.store.interrupt_effect("worker-1", "lost-rpc", "RPC process exited before replying")
+            self.assertTrue(interrupted["found"])
+            self.assertTrue(interrupted["interrupted"])
+            self.assertEqual(interrupted["effect"]["state"], "interrupted")
+            self.assertIn("unknown", interrupted["effect"]["error"])
+            self.assertIsNone(interrupted["effect"]["result"])
+            self.assertEqual(self.store.context()["active_tools"], 0)
+            self.assertEqual(self.store.read_work("root")["state"], "leased")
+            self.assertEqual(self.store.read_work("root")["failure_count"], 0)
+            replacement = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "next-rpc")
+            self.assertTrue(replacement["execute"])
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                self.store.finish_effect(effect["id"], "worker-1", "root", lease["lease_token"],
+                                         result={"judgement": "verified"})
+            self.store.finish_effect(replacement["id"], "worker-1", "root", lease["lease_token"],
+                                     result={"judgement": "unknown"})
+            self.complete(lease, note="Report checked evidence and retain the interrupted outcome")
+
+    def test_host_interruption_is_idempotent_and_does_not_overwrite_finished_receipts(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "interrupt-once")
+        first = self.store.interrupt_effect("worker-1", "interrupt-once", "transport closed")
+        event_count = len(self.store.report()["events"])
+        again = self.store.interrupt_effect("worker-1", "interrupt-once", "second notification")
+        self.assertFalse(again["interrupted"])
+        self.assertEqual(first["effect"], again["effect"])
+        self.assertEqual(len(self.store.report()["events"]), event_count)
+        self.assertEqual(self.store.effect(effect["id"]), first["effect"])
+        for index, outcome in enumerate(({"result": {"judgement": "verified"}}, {"error": "bad candidate"})):
+            key = f"finished-{index}"
+            record = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, key)
+            finished = self.store.finish_effect(record["id"], "worker-1", "root", lease["lease_token"], **outcome)
+            notification = self.store.interrupt_effect("worker-1", key, "reply was lost after commit")
+            self.assertFalse(notification["interrupted"])
+            self.assertEqual(notification["effect"], finished)
+            self.assertEqual(self.store.effect(record["id"]), finished)
+
+    def test_host_interruption_checks_owner_and_is_not_an_agent_operation(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "owned")
+        with self.assertRaisesRegex(RuntimeError, "another owner"):
+            self.store.interrupt_effect("foreign-worker", "owned", "wrong caller")
+        self.assertEqual(self.store.effect(effect["id"])["state"], "running")
+        self.assertEqual(self.store.interrupt_effect("worker-1", "not-reserved", "RPC failed before admission"),
+                         {"found": False, "interrupted": False})
+        for reason in ("", " ", None, "x" * 8001):
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                self.store.interrupt_effect("worker-1", "owned", reason)
+        with self.assertRaisesRegex(ValueError, "Unknown work operation"):
+            self.op("interrupt_effect", {"request_key": "owned", "reason": "agent requested interruption"})
+
     def test_host_result_is_immutable_but_unknown_judgement_is_not_false(self):
         lease = self.claim()
         effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "host-check")
@@ -284,6 +345,81 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(final["effect_ids"], [effect["effect_id"]])
         self.assertEqual(final["result_status"], "agent_authored_not_independently_verified")
         self.assertNotIn("lease_token", self.store.effect(effect["effect_id"]))
+
+    def test_restart_discovers_effect_committed_before_work_completion(self):
+        old = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", old["lease_token"], "exact_check",
+                                           {"candidate": "a concrete construction"}, "before-crash")
+        result = {"judgement": "verified", "scope": "finite construction only"}
+        committed = self.store.finish_effect(effect["id"], "worker-1", "root", old["lease_token"], result=result)
+        self.assertEqual(self.store.read_work("root")["effect_ids"], [])
+        # The launcher exits here: no complete_work call, no old conversation.
+        with patch("infinity_research.kernel.time.time", return_value=old["lease_expires"] + 1):
+            restarted = GenericStore(self.root)
+            fresh = restarted.dispatch_work("claim_work", {"work_id": "root"},
+                                             owner="resumed-worker", request_key="after-crash")
+            self.assertTrue(fresh["claimed"])
+            self.assertEqual(fresh["work"]["effect_ids"], [])
+            self.assertEqual(fresh["work"]["effect_count"], 1)
+            summary = fresh["work"]["recent_effects"][0]
+            self.assertEqual(summary["id"], effect["id"])
+            self.assertEqual(summary["attempt"], 1)
+            self.assertTrue(summary["result_available"])
+            self.assertEqual(summary["state"], "succeeded")
+            reread = restarted.effect(summary["id"])
+            self.assertEqual(reread["result_sha256"], committed["result_sha256"])
+            self.assertEqual(reread["result"], result)
+            self.assertEqual(restarted.read_work("root")["recent_effects"], [summary])
+
+    def test_effect_pagination_is_complete_bounded_and_omits_payloads_and_authority(self):
+        lease = self.claim()
+        other = self.op("create_work", {"goal": "No effects here"})["work_id"]
+        ids, states = set(), set()
+        for index in range(16):
+            key = f"private-request-{index}"
+            effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check",
+                                               {"private_argument": "not discovery metadata"}, key)
+            ids.add(effect["id"])
+            if index >= 12:
+                states.add("running")
+            elif index % 3 == 0:
+                self.store.finish_effect(effect["id"], "worker-1", "root", lease["lease_token"],
+                                         result={"private_result": "read the selected effect separately"})
+                states.add("succeeded")
+            elif index % 3 == 1:
+                self.store.finish_effect(effect["id"], "worker-1", "root", lease["lease_token"],
+                                         error="private diagnostic")
+                states.add("failed")
+            else:
+                self.store.interrupt_effect("worker-1", key, "private interruption reason")
+                states.add("interrupted")
+        seen, cursor, seen_states = [], None, set()
+        expected_keys = {"id", "capability", "state", "attempt", "created", "finished",
+                         "result_status", "result_available"}
+        while True:
+            page = self.store.list_effects("root", after_id=cursor, limit=3)
+            self.assertLessEqual(len(page["items"]), 3)
+            for item in page["items"]:
+                self.assertEqual(set(item), expected_keys)
+                seen.append(item["id"])
+                seen_states.add(item["state"])
+                self.assertEqual(item["result_available"], item["state"] == "succeeded")
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(seen, sorted(ids))
+        self.assertEqual(seen_states, states)
+        current = self.store.read_work("root")
+        self.assertEqual(current["effect_count"], 16)
+        self.assertEqual(len(current["recent_effects"]), 8)
+        self.assertTrue(all(set(item) == expected_keys for item in current["recent_effects"]))
+        self.assertEqual(current["effect_ids"], [])
+        self.assertEqual(self.store.list_effects(other), {"items": [], "next_cursor": None})
+        for limit in (0, 101, True, 1.5):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                self.store.list_effects("root", limit=limit)
+        with self.assertRaisesRegex(ValueError, "Unknown work"):
+            self.store.list_effects("not-a-work-item")
 
     def test_bounded_large_tool_results_fit_the_capability_envelope(self):
         lease = self.claim()

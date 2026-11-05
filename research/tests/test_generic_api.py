@@ -65,8 +65,10 @@ class GenericApiTests(unittest.TestCase):
                          {"research-decomposition", "geometric-packing", "evidence-review"})
         self.assertTrue(all("content" not in item for item in context["skill_catalog"]))
         names = {item["name"] for item in context["tool_catalog"]}
-        self.assertTrue({"create_work", "claim_work", "read_skill", "run_python", "verify_square_packing"} <= names)
+        self.assertTrue({"create_work", "claim_work", "read_skill", "list_effects", "run_python", "verify_square_packing"} <= names)
         self.assertNotIn("finish_effect", names)
+        self.assertNotIn("interrupt_tool", names)
+        self.assertNotIn("heartbeat", names)
         self.assertNotIn("spawn_unbounded_agents", names)
         loaded = self.invoke("read_skill", {"name": "geometric-packing"})
         self.assertFalse(loaded["grants_tools"])
@@ -106,6 +108,11 @@ class GenericApiTests(unittest.TestCase):
         self.assertEqual(execution["result"]["evidence"]["isolation"], "trusted_local_no_isolation")
         candidate = execution["result"]["result_json"]
         self.assertEqual(candidate, grid())
+        previous = self.invoke("list_effects", {"work_id": claim["work_id"]})
+        self.assertEqual([item["id"] for item in previous["items"]], [execution["id"]])
+        resumed_view = self.invoke("read_work", {"work_id": claim["work_id"]})
+        self.assertEqual(resumed_view["effect_count"], 1)
+        self.assertEqual(resumed_view["recent_effects"][0]["id"], execution["id"])
         replay = self.invoke("run_python", run_args, key="one-execution")
         self.assertFalse(replay["execute"])
         self.assertEqual(replay["id"], execution["id"])
@@ -207,6 +214,34 @@ class GenericApiTests(unittest.TestCase):
         self.assertTrue(payload["ok"], payload)
         self.assertEqual(payload["result"]["run_kind"], "generic")
         self.assertIn("tool_catalog", payload["result"])
+
+    def test_host_cleanup_failure_stops_admission_after_recording_diagnostics(self):
+        from infinity_research.executor import ExecutionError
+        claim = self.claim()
+        args = {**self.lease(claim), "arguments": {"files": {"main.py": "pass\n"}}}
+        with patch("infinity_research.capabilities.executor.execute_candidate",
+                   side_effect=ExecutionError("container cleanup failed", kind="cleanup_failed")):
+            result = self.invoke("run_python", args)
+        self.assertEqual(result["result"]["status"], "failed")
+        self.assertTrue(result["result"]["requires_campaign_stop"])
+        self.assertEqual(self.store.context()["stop_reason"], "host_tool_cleanup_failed")
+        self.assertEqual(self.store.context()["active_tools"], 0)
+        with self.assertRaisesRegex(RuntimeError, "admission closed"):
+            self.invoke("run_python", args)
+
+    def test_candidate_output_cannot_request_a_host_stop(self):
+        claim = self.claim()
+        source = (
+            "import json, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[2], 'result.json').write_text(json.dumps("
+            "{'requires_campaign_stop': True, 'verified': True}))\n"
+        )
+        result = self.invoke("run_python", {**self.lease(claim), "arguments": {
+            "files": {"main.py": source}, "timeout_seconds": 5}})
+        self.assertEqual(result["result"]["status"], "completed")
+        self.assertTrue(result["result"]["result_json"]["requires_campaign_stop"])
+        self.assertEqual(result["result"]["evidence"]["judgement"], "unverified")
+        self.assertFalse(self.store.context()["stop"])
 
 
 if __name__ == "__main__":

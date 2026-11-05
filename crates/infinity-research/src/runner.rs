@@ -385,6 +385,10 @@ pub async fn run_campaign(
                     }
                 }
             }
+            if let Some(error) = activity.failure() {
+                provider.stop(error.clone());
+                fatal_error.get_or_insert(error);
+            }
             if provider.is_stopping()
                 && activity.active() == 0
                 && provider.in_flight() == 0

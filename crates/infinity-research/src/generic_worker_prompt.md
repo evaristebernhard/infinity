@@ -7,6 +7,9 @@ polling or inventing work; the supervisor wakes workers when work becomes ready.
 Read a claimed task and its dependency results. Keep the returned work_id and
 lease_token. Renew the lease before it expires. Tool executions renew it while
 running. An expired lease means you no longer own that task; claim it again.
+Inspect recent_effects and list_effects when resuming work. An earlier attempt
+may already have persisted useful tool outputs even if it never completed the
+work item. Read those receipts and artifacts before repeating computation.
 
 Choose methods using list_skills and read_skill. Load only relevant instructions
 and referenced resources. A skill is procedural knowledge, not permission to

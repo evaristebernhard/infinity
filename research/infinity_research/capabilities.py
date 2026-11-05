@@ -391,6 +391,10 @@ def _run_python(args: dict, *, root: Path, directory: Path, spec: dict,
             raise heartbeat_error[0]
         envelope.update(status="failed", error=str(error)[:2000],
                         error_kind=getattr(error, "kind", "invalid_output"))
+        # A failed cleanup can leave compute alive. Do not silently admit more
+        # work into that environment. This flag is host-owned, never copied
+        # from the candidate's result_json.
+        envelope["requires_campaign_stop"] = envelope["error_kind"] == "cleanup_failed"
         envelope["evidence"]["exit_code"] = getattr(error, "exit_code", None)
     envelope["elapsed_seconds"] = time.monotonic() - started
     envelope["log_tail"] = _log_tail(log)

@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,6 +62,11 @@ struct Receipt {
     result: Value,
 }
 
+struct WireReceipt {
+    name: String,
+    envelope: Value,
+}
+
 enum Action {
     Tool(&'static str, Value),
     Done(&'static str),
@@ -78,7 +83,7 @@ fn research_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../research")
 }
 
-fn receipts(request: &CompletionRequest) -> Result<Vec<Receipt>, CompletionError> {
+fn wire_receipts(request: &CompletionRequest) -> Result<Vec<WireReceipt>, CompletionError> {
     let mut calls = HashMap::new();
     let mut results = Vec::new();
     for message in &request.chat_history {
@@ -102,18 +107,12 @@ fn receipts(request: &CompletionRequest) -> Result<Vec<Receipt>, CompletionError
                             })
                             .expect("fixture tool result must include text");
                         let value: Value = serde_json::from_str(body)?;
-                        if value["ok"] != true {
-                            return Err(CompletionError::provider(
-                                ErrorClass::Fatal,
-                                format!("generic fixture tool {} failed: {value}", result.id),
-                            ));
-                        }
-                        results.push(Receipt {
+                        results.push(WireReceipt {
                             name: calls
                                 .get(&result.id)
                                 .expect("tool receipt must match its recorded call")
                                 .clone(),
-                            result: value["result"].clone(),
+                            envelope: value,
                         });
                     }
                 }
@@ -121,6 +120,27 @@ fn receipts(request: &CompletionRequest) -> Result<Vec<Receipt>, CompletionError
         }
     }
     Ok(results)
+}
+
+fn receipts(request: &CompletionRequest) -> Result<Vec<Receipt>, CompletionError> {
+    wire_receipts(request)?
+        .into_iter()
+        .map(|receipt| {
+            if receipt.envelope["ok"] != true {
+                return Err(CompletionError::provider(
+                    ErrorClass::Fatal,
+                    format!(
+                        "generic fixture tool {} failed: {}",
+                        receipt.name, receipt.envelope
+                    ),
+                ));
+            }
+            Ok(Receipt {
+                name: receipt.name,
+                result: receipt.envelope["result"].clone(),
+            })
+        })
+        .collect()
 }
 
 fn is_supervisor_continuation(request: &CompletionRequest) -> bool {
@@ -614,4 +634,393 @@ async fn generic_native_campaign_decomposes_checks_joins_and_resumes_without_idl
     assert_eq!(restart.model_calls_this_process, 0);
     assert_eq!(restart.stop_reason, "work_graph_completed");
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls_before_restart);
+}
+
+const RECOVERY_SETUP: &str = r#"
+import json, sys
+from pathlib import Path
+from infinity_research.generic_api import initialize
+root = Path(sys.argv[1])
+task = root / 'task.json'
+task.write_text(json.dumps({
+    'schema_version': 2, 'task_id': 'native-orphan-recovery',
+    'goal': 'Verify the known four-square grid after an interrupted tool RPC.',
+    'capabilities': ['verify_square_packing'], 'skills': ['geometric-packing'],
+    'limits': {'max_workers': 4, 'max_model_calls': 20, 'max_output_tokens': 2048,
+               'max_work_items': 10, 'max_failures': 2, 'max_parallel_tools': 1,
+               'max_wall_seconds': 300, 'lease_seconds': 120}
+}))
+store = initialize(task, root / 'campaign')
+print(json.dumps({'campaign': str(store.root)}))
+"#;
+
+const RESERVE_BEFORE_REPLY_LOSS: &str = r#"
+import json, sys
+from pathlib import Path
+from infinity_research.kernel import GenericStore
+store = GenericStore(Path(sys.argv[1]))
+request = json.loads(sys.argv[2])
+args = request['arguments']
+effect = store.reserve_effect(request['owner'], args['work_id'], args['lease_token'],
+    request['tool'], args['arguments'], request['request_key'])
+print(json.dumps(effect))
+"#;
+
+const CHECK_LATE_COMPLETION: &str = r#"
+import json, sys
+from pathlib import Path
+from infinity_research.kernel import GenericStore
+store = GenericStore(Path(sys.argv[1]))
+attempt = json.loads(sys.argv[2])
+request, effect = attempt['request'], attempt['effect']
+args = request['arguments']
+try:
+    store.finish_effect(effect['id'], request['owner'], args['work_id'], args['lease_token'],
+        result={'judgement': 'a late worker must not replace an unknown result'})
+except RuntimeError as error:
+    late_error = str(error)
+else:
+    raise AssertionError('Late completion was not fenced')
+replay = store.reserve_effect(request['owner'], args['work_id'], args['lease_token'],
+    request['tool'], args['arguments'], request['request_key'])
+print(json.dumps({'late_error': late_error, 'replay': replay, 'effect': store.effect(effect['id'])}))
+"#;
+
+/// Simulate the narrow crash window after real durable admission but before a
+/// usable RPC response. Recovery and subsequent execution use real Python RPC.
+struct ReplyLossBackend {
+    inner: PythonBackend,
+    campaign: PathBuf,
+    injected: AtomicBool,
+    admitted: Mutex<Option<Value>>,
+    interruptions: Mutex<Vec<Value>>,
+    fail_interruption: bool,
+}
+
+async fn python_request(script: &str, campaign: &Path, request: &Value) -> Result<Value, BoxError> {
+    let output = tokio::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(campaign)
+        .arg(request.to_string())
+        .current_dir(research_root())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "Python recovery fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+#[async_trait]
+impl ResearchBackend for ReplyLossBackend {
+    async fn call(&self, operation: &str, arguments: Value) -> Result<Value, BoxError> {
+        if operation == "invoke_tool"
+            && arguments["tool"] == "verify_square_packing"
+            && !self.injected.swap(true, Ordering::SeqCst)
+        {
+            let effect =
+                python_request(RESERVE_BEFORE_REPLY_LOSS, &self.campaign, &arguments).await?;
+            assert_eq!(effect["execute"], true);
+            assert_eq!(effect["state"], "running");
+            *self.admitted.lock().expect("admitted recovery fixture") =
+                Some(json!({"request": arguments, "effect": effect}));
+            return Err("simulated_reply_loss after reserve_effect committed".into());
+        }
+        if operation == "interrupt_tool" {
+            self.interruptions
+                .lock()
+                .expect("interruption fixture log")
+                .push(arguments.clone());
+            if self.fail_interruption {
+                return Err("simulated interruption persistence failure".into());
+            }
+        }
+        self.inner.call(operation, arguments).await
+    }
+}
+
+struct RecoveryFixture {
+    calls: AtomicUsize,
+    recovered_errors: AtomicUsize,
+    retry_after_loss: bool,
+}
+
+#[async_trait]
+impl ModelProvider for RecoveryFixture {
+    async fn list_models(&self) -> Result<Vec<ModelEntry>, BoxError> {
+        Ok(vec![ModelEntry {
+            model_id: "recovery-fixture".into(),
+            display_name: "Offline crash-recovery decisions".into(),
+            context_window: 0,
+            max_output_tokens: Some(4096),
+            supports_image_input: false,
+        }])
+    }
+
+    async fn invoke_model(
+        &self,
+        _model: &str,
+        request: CompletionRequest,
+    ) -> Result<ModelStream, CompletionError> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let responses = wire_receipts(&request)?;
+        let action = if is_supervisor_continuation(&request) || responses.is_empty() {
+            Action::Tool("claim_work", json!({}))
+        } else {
+            let last = responses.last().expect("nonempty recovery receipts");
+            let claim = &responses
+                .iter()
+                .find(|receipt| receipt.name == "claim_work")
+                .expect("recovery worker first claims the root")
+                .envelope["result"];
+            assert_eq!(claim["claimed"], true);
+            if last.envelope["ok"] != true {
+                assert_eq!(last.name, "verify_square_packing");
+                assert!(
+                    last.envelope["error"]
+                        .as_str()
+                        .expect("transport error")
+                        .contains("simulated_reply_loss")
+                );
+                if self.retry_after_loss {
+                    assert_eq!(
+                        self.recovered_errors.fetch_add(1, Ordering::SeqCst),
+                        0,
+                        "only the injected attempt should fail"
+                    );
+                    assert_eq!(last.envelope["recovery"]["interrupted"], true);
+                    assert_eq!(last.envelope["recovery"]["effect"]["state"], "interrupted");
+                    assert_eq!(last.envelope["recovery"]["effect"]["result"], Value::Null);
+                    let mut arguments = lease(claim);
+                    arguments["arguments"] = packing(4);
+                    Action::Tool("verify_square_packing", arguments)
+                } else {
+                    Action::Done("Host recovery failed; leave the recorded effect unresolved.")
+                }
+            } else {
+                match last.name.as_str() {
+                    "claim_work" => {
+                        let mut arguments = lease(claim);
+                        arguments["arguments"] = packing(4);
+                        Action::Tool("verify_square_packing", arguments)
+                    }
+                    "verify_square_packing" => {
+                        let effect = &last.envelope["result"];
+                        assert_eq!(
+                            effect["state"], "succeeded",
+                            "recovery checker result: {effect}"
+                        );
+                        assert_eq!(effect["result"]["evidence"]["judgement"], "verified");
+                        let mut arguments = lease(claim);
+                        arguments["effect_ids"] = json!([effect["id"]]);
+                        arguments["result"] = json!({"recovered": true, "n": 4});
+                        Action::Tool("complete_work", arguments)
+                    }
+                    "complete_work" => Action::Done("The explicit replacement attempt completed."),
+                    other => panic!("unexpected recovery tool reply: {other}"),
+                }
+            }
+        };
+        let next = match action {
+            Action::Tool(name, arguments) => StreamChunk::ToolCall(ToolCall::new(
+                format!("recovery-{index}-{name}"),
+                name,
+                arguments,
+            )),
+            Action::Done(text) => StreamChunk::Text(text.into()),
+        };
+        Ok(Box::pin(futures_util::stream::iter(vec![
+            Ok(next),
+            Ok(StreamChunk::Final(FinalResponse {
+                usage: Some(Usage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    total_tokens: 30,
+                    cached_input_tokens: 0,
+                }),
+            })),
+        ])))
+    }
+}
+
+async fn recovery_fixture(
+    fail_interruption: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<ReplyLossBackend>,
+    Arc<RecoveryFixture>,
+    RunOptions,
+) {
+    let temporary = tempfile::tempdir().expect("create interrupted-RPC campaign");
+    python(RECOVERY_SETUP, temporary.path()).await;
+    let campaign = temporary.path().join("campaign");
+    let backend = Arc::new(ReplyLossBackend {
+        inner: PythonBackend::new("python3", research_root(), campaign.clone())
+            .expect("recovery Python bridge"),
+        campaign,
+        injected: AtomicBool::new(false),
+        admitted: Mutex::new(None),
+        interruptions: Mutex::new(Vec::new()),
+        fail_interruption,
+    });
+    let provider = Arc::new(RecoveryFixture {
+        calls: AtomicUsize::new(0),
+        recovered_errors: AtomicUsize::new(0),
+        retry_after_loss: !fail_interruption,
+    });
+    let options = RunOptions {
+        workers: 4,
+        max_output_tokens: 1024,
+        poll_interval: Duration::from_millis(50),
+        model_response_timeout: Duration::from_secs(10),
+        model_call_timeout: Duration::from_secs(20),
+    };
+    (temporary, backend, provider, options)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupted_tool_rpc_releases_its_slot_before_a_live_worker_retries() {
+    let (_temporary, backend, provider, options) = recovery_fixture(false).await;
+    let summary = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_campaign(
+            options,
+            backend.clone(),
+            provider.clone(),
+            "recovery-fixture",
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("orphan recovery must not wait for the 120-second work lease")
+    .expect("live worker must recover its interrupted effect");
+    assert_eq!(summary.stop_reason, "work_graph_completed");
+    assert!(
+        summary.model_calls_this_process < 12,
+        "recovery must not idle-loop: {summary:?}"
+    );
+    assert_eq!(provider.recovered_errors.load(Ordering::SeqCst), 1);
+    let admitted = backend
+        .admitted
+        .lock()
+        .expect("admitted effect")
+        .clone()
+        .expect("injected crash window");
+    let interruptions = backend
+        .interruptions
+        .lock()
+        .expect("interruption log")
+        .clone();
+    assert_eq!(interruptions.len(), 1);
+    assert_eq!(interruptions[0]["owner"], admitted["request"]["owner"]);
+    assert_eq!(
+        interruptions[0]["request_key"],
+        admitted["request"]["request_key"]
+    );
+
+    let report = python(REPORT, &backend.campaign).await;
+    let effects = report["effects"].as_array().expect("durable effects");
+    assert_eq!(effects.len(), 2);
+    assert_eq!(effects[0]["id"], admitted["effect"]["id"]);
+    assert_eq!(effects[0]["state"], "interrupted");
+    assert_eq!(effects[0]["result"], Value::Null);
+    assert!(
+        effects[0]["error"]
+            .as_str()
+            .expect("unknown outcome reason")
+            .contains("unknown")
+    );
+    assert_eq!(effects[1]["state"], "succeeded");
+    assert_eq!(
+        effects[1]["result"]["evidence"]["optimality"],
+        "area_bound_closed"
+    );
+    assert_eq!(effects[0]["arguments"], effects[1]["arguments"]);
+    assert_ne!(
+        effects[0]["id"], effects[1]["id"],
+        "the replacement is a new explicit effect"
+    );
+    assert_eq!(report["active_tools"], 0);
+    assert_eq!(report["work"][0]["state"], "succeeded");
+    assert_eq!(
+        report["work"][0]["attempt_count"], 1,
+        "work lease never needed to expire"
+    );
+    assert_eq!(report["work"][0]["failure_count"], 0);
+    assert_eq!(report["work"][0]["effect_ids"], json!([effects[1]["id"]]));
+    assert!(
+        !backend
+            .campaign
+            .join("effects")
+            .join(admitted["effect"]["id"].as_str().expect("effect ID"))
+            .exists(),
+        "the crashed attempt was reserved but never executed"
+    );
+
+    let late = python_request(CHECK_LATE_COMPLETION, &backend.campaign, &admitted)
+        .await
+        .expect("check late completion and same-key replay");
+    assert!(
+        late["late_error"]
+            .as_str()
+            .expect("fencing error")
+            .contains("late result is fenced")
+    );
+    assert_eq!(late["replay"]["execute"], false);
+    assert_eq!(late["replay"]["duplicate"], true);
+    assert_eq!(late["replay"]["state"], "interrupted");
+    assert_eq!(late["effect"]["result"], Value::Null);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_to_persist_interruption_stops_the_native_launcher_with_an_error() {
+    let (_temporary, backend, provider, options) = recovery_fixture(true).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_campaign(
+            options,
+            backend.clone(),
+            provider.clone(),
+            "recovery-fixture",
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("failed host recovery must stop promptly");
+    let error =
+        result.expect_err("unrecorded interruption is a launcher failure, not task success");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot recover interrupted tool"),
+        "{error}"
+    );
+    assert!(provider.calls.load(Ordering::SeqCst) < 8);
+    assert_eq!(
+        backend
+            .interruptions
+            .lock()
+            .expect("interruption log")
+            .len(),
+        1
+    );
+    let report = python(REPORT, &backend.campaign).await;
+    assert_eq!(
+        report["effects"]
+            .as_array()
+            .expect("unresolved durable effect")
+            .len(),
+        1
+    );
+    assert_eq!(
+        report["effects"][0]["state"], "running",
+        "a failed host write cannot pretend that an unknown effect was fenced"
+    );
+    assert_eq!(report["effects"][0]["result"], Value::Null);
+    assert_eq!(report["work_counts"]["succeeded"], 0);
 }

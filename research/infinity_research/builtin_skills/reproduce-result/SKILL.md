@@ -5,6 +5,11 @@ description: Recreate a result from its recorded artifacts and write a durable h
 
 # Reproduce a result
 
+When resuming unfinished work, inspect its saved tool receipts first, using
+`list_effects` when available. A previous attempt may have committed outputs
+without completing the work item. Distinguish an existing receipt from a new
+reproduction; do not rerun computation just because the conversation was lost.
+
 Read the original evidence record and obtain exact artifact versions. Record
 source hash, input hash, task contract, tool/checker versions, environment image,
 parameters, seeds, thread settings, and any starting checkpoint. If a field is

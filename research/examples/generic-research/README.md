@@ -99,7 +99,8 @@ python3 -m infinity_research.cli stop --campaign research/runs/generic-squares-0
 ```
 
 重新运行同一个 launcher 会读取已有工作与证据，过期租约可重新领取。新进程不
-重建未持久化的对话。失联工具结果记为未知，不会自动再跑一遍外部动作。
+重建未持久化的对话。新 worker 可查询此前各次尝试的工具记录，使用已经落盘的
+结果。失联工具结果记为未知，不会自动再跑一遍外部动作。
 schema 2 没有隐含的留出集 `finalize` 步骤；最终报告按实际工具证据解释。
 
 宿主定期给活跃 native worker 续租，工具运行也续租；模型长时间推理不会单纯

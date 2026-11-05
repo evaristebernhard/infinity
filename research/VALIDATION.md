@@ -8,8 +8,8 @@ Kaggle result or a long-duration production campaign.
 
 | Check | Result |
 | --- | --- |
-| Python backend, kernel, skills, tools, executor and domain tests | 120 passed, including optional pycocotools interoperability |
-| Native `infinity-research` tests | 15 passed |
+| Python backend, kernel, skills, tools, executor and domain tests | 127 passed, including optional pycocotools interoperability |
+| Native `infinity-research` tests | 17 passed |
 | `cargo clippy -p infinity-research --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --all --check` | Passed |
 | Native launcher `--help` | Passed |
@@ -48,6 +48,19 @@ limits, dependency cycles, blocked descendants, immutable receipts, stale leases
 interrupted effects without replay, pagination, and host heartbeat renewal during
 long model reasoning. Host stop drains admitted tools; neither a heartbeat nor
 a late result can revive a lost attempt.
+
+Two native fault-injection tests cover an RPC disappearing after a real effect
+reservation. A live worker can retry after the host records the original effect
+as interrupted and releases its single tool slot. If that interruption cannot
+be persisted, the launcher exits with an error instead of continuing inference.
+The unknown receipt is retained and a late completion cannot overwrite it.
+
+Restart tests also preserve a completed tool result when the owning work item
+has not yet been completed. A replacement worker discovers the old receipt
+through its work summary or paginated `list_effects`, then reads the same result
+hash. Effect summaries omit transport credentials and full result payloads.
+An executor cleanup failure records diagnostics and stops new admission;
+candidate-written output cannot forge that host stop signal.
 
 The composition tests execute a trusted Python program that writes a layout,
 call a different exact verification tool, read the real certificate, and complete
