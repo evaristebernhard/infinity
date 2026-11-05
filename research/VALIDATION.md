@@ -8,7 +8,7 @@ Kaggle result or a long-duration production campaign.
 
 | Check | Result |
 | --- | --- |
-| Python backend, kernel, skills, tools, executor and domain tests | 127 passed, including optional pycocotools interoperability |
+| Python backend, kernel, skills, tools, executor and domain tests | 129 passed, including optional pycocotools interoperability |
 | Native `infinity-research` tests | 17 passed |
 | `cargo clippy -p infinity-research --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --all --check` | Passed |
@@ -61,6 +61,10 @@ through its work summary or paginated `list_effects`, then reads the same result
 hash. Effect summaries omit transport credentials and full result payloads.
 An executor cleanup failure records diagnostics and stops new admission;
 candidate-written output cannot forge that host stop signal.
+The receipt, stop state and cancellation of pending work commit atomically.
+Separate connections verify that a competing admission waits for that commit
+and is then rejected; an injected transaction failure rolls all these changes
+and their events back together.
 
 The composition tests execute a trusted Python program that writes a layout,
 call a different exact verification tool, read the real certificate, and complete

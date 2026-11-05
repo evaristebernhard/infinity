@@ -182,16 +182,19 @@ def invoke(store, envelope):
         # the recovery record remains interrupted rather than fabricated success.
         return store.finish_effect(effect["effect_id"], owner, work_id, token,
                                    error=f"{type(error).__name__}: {error}"[:4096])
+    # This is the host adapter envelope, not candidate-authored result_json.
+    # Persist its stop requirement in the same transaction as the receipt.
+    stop_reason = ("host_tool_cleanup_failed" if isinstance(output, dict)
+                   and output.get("requires_campaign_stop") is True else None)
     try:
-        receipt = store.finish_effect(effect["effect_id"], owner, work_id, token, result=output)
+        return store.finish_effect(effect["effect_id"], owner, work_id, token,
+                                   result=output, stop_reason=stop_reason)
     except (ValueError, TypeError, OverflowError) as error:
         # A malformed/oversized adapter response must not leave a running receipt.
         # Fencing and storage errors still propagate; do not erase committed data.
         return store.finish_effect(effect["effect_id"], owner, work_id, token,
-                                   error=f"Invalid host tool response: {error}"[:4096])
-    if output.get("requires_campaign_stop") is True:
-        store.stop("host_tool_cleanup_failed")
-    return receipt
+                                   error=f"Invalid host tool response: {error}"[:4096],
+                                   stop_reason=stop_reason)
 
 
 def dispatch(store, operation, args):

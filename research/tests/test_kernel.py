@@ -3,7 +3,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -345,6 +347,79 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(final["effect_ids"], [effect["effect_id"]])
         self.assertEqual(final["result_status"], "agent_authored_not_independently_verified")
         self.assertNotIn("lease_token", self.store.effect(effect["effect_id"]))
+
+    def test_effect_result_and_host_stop_are_atomic_to_readers_and_admission(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "needs-stop")
+        other_id = self.op("create_work", {"goal": "Concurrent ready worker"})["work_id"]
+        other_lease = self.claim(other_id, owner="other-worker")
+        other = GenericStore(self.root)
+        result_written, release_stop, contender_started = threading.Event(), threading.Event(), threading.Event()
+        original_stop = self.store._stop_in_transaction
+
+        def pause_before_stop(db, reason):
+            result_written.set()
+            if not release_stop.wait(timeout=5):
+                raise RuntimeError("Test did not release the paused stop transaction")
+            original_stop(db, reason)
+
+        def competing_admission():
+            contender_started.set()
+            return other.reserve_effect("other-worker", other_id, other_lease["lease_token"],
+                                        "exact_check", {}, "competing-effect")
+
+        with patch.object(self.store, "_stop_in_transaction", side_effect=pause_before_stop):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                finisher = pool.submit(self.store.finish_effect, effect["id"], "worker-1", "root", lease["lease_token"],
+                                       result={"diagnostic": "host requests a stop"}, stop_reason="host_failure")
+                try:
+                    self.assertTrue(result_written.wait(timeout=3))
+                    # The finish update has executed, but its encompassing
+                    # transaction has not committed. A separate WAL reader must
+                    # still see the old receipt, never completed + active.
+                    with sqlite3.connect(self.store.path) as reader:
+                        visible = reader.execute("""SELECT e.state,e.result,c.status FROM effects e
+                            CROSS JOIN campaign c WHERE e.id=? AND c.id=1""", (effect["id"],)).fetchone()
+                    self.assertEqual(visible, ("running", None, "active"))
+                    contender = pool.submit(competing_admission)
+                    self.assertTrue(contender_started.wait(timeout=3))
+                    with self.assertRaises(TimeoutError):
+                        contender.result(timeout=0.05)
+                finally:
+                    release_stop.set()
+                self.assertEqual(finisher.result(timeout=3)["state"], "succeeded")
+                with self.assertRaisesRegex(RuntimeError, "admission closed: host_failure"):
+                    contender.result(timeout=3)
+        with sqlite3.connect(self.store.path) as reader:
+            visible = reader.execute("""SELECT e.state,c.status,c.reason FROM effects e
+                CROSS JOIN campaign c WHERE e.id=? AND c.id=1""", (effect["id"],)).fetchone()
+            admitted = reader.execute("SELECT COUNT(*) FROM effects WHERE request_key='competing-effect'").fetchone()[0]
+        self.assertEqual(visible, ("succeeded", "stopped", "host_failure"))
+        self.assertEqual(admitted, 0)
+
+    def test_failed_atomic_stop_rolls_back_receipt_campaign_and_queue_together(self):
+        lease = self.claim()
+        child = self.op("create_work", {"goal": "Must remain pending if the transaction rolls back"})["work_id"]
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "rollback-stop")
+        previous_events = self.store.report()["events"]
+        original_event = self.store._event
+
+        def fail_after_stop_update(db, kind, payload):
+            if kind == "campaign_stopped":
+                # Fail after the stop and queued-work cancellation SQL ran.
+                raise RuntimeError("Simulated process failure before commit")
+            original_event(db, kind, payload)
+
+        with patch.object(self.store, "_event", side_effect=fail_after_stop_update):
+            with self.assertRaisesRegex(RuntimeError, "before commit"):
+                self.store.finish_effect(effect["id"], "worker-1", "root", lease["lease_token"],
+                                         result={"diagnostic": "host failure"}, stop_reason="host_failure")
+        resumed = GenericStore(self.root)
+        self.assertEqual(resumed.effect(effect["id"])["state"], "running")
+        self.assertIsNone(resumed.effect(effect["id"])["result"])
+        self.assertFalse(resumed.context()["stop"])
+        self.assertEqual(resumed.read_work(child)["state"], "pending")
+        self.assertEqual(resumed.report()["events"], previous_events)
 
     def test_restart_discovers_effect_committed_before_work_completion(self):
         old = self.claim()

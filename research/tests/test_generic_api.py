@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -215,13 +216,24 @@ class GenericApiTests(unittest.TestCase):
         self.assertEqual(payload["result"]["run_kind"], "generic")
         self.assertIn("tool_catalog", payload["result"])
 
-    def test_host_cleanup_failure_stops_admission_after_recording_diagnostics(self):
+    def test_host_cleanup_failure_records_diagnostics_and_closes_admission_atomically(self):
         from infinity_research.executor import ExecutionError
         claim = self.claim()
         args = {**self.lease(claim), "arguments": {"files": {"main.py": "pass\n"}}}
+        original_stop = self.store._stop_in_transaction
+        observations = []
+
+        def observe_before_stop(db, reason):
+            with sqlite3.connect(self.store.path) as reader:
+                observations.append(reader.execute("""SELECT e.state,e.result,c.status FROM effects e
+                    CROSS JOIN campaign c WHERE e.work_id='root' AND c.id=1""").fetchall())
+            original_stop(db, reason)
+
         with patch("infinity_research.capabilities.executor.execute_candidate",
-                   side_effect=ExecutionError("container cleanup failed", kind="cleanup_failed")):
+                   side_effect=ExecutionError("container cleanup failed", kind="cleanup_failed")), \
+                patch.object(self.store, "_stop_in_transaction", side_effect=observe_before_stop):
             result = self.invoke("run_python", args)
+        self.assertEqual(observations, [[("running", None, "active")]])
         self.assertEqual(result["result"]["status"], "failed")
         self.assertTrue(result["result"]["requires_campaign_stop"])
         self.assertEqual(self.store.context()["stop_reason"], "host_tool_cleanup_failed")

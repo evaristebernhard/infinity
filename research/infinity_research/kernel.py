@@ -536,14 +536,21 @@ class GenericStore:
         return item
 
     def finish_effect(self, effect_id: str, owner: str, work_id: str, lease_token: str, *,
-                      result: dict | None = None, error: str | None = None) -> dict:
-        """Host-only completion. Never expose this method as an agent tool."""
+                      result: dict | None = None, error: str | None = None,
+                      stop_reason: str | None = None) -> dict:
+        """Host-only completion, atomically applying any requested campaign stop.
+
+        The caller determines whether stopping is required. The kernel neither
+        interprets domain-specific result fields nor accepts stops from agents.
+        """
         if (result is None) == (error is None):
             raise ValueError("Provide exactly one of a tool result or an execution error")
         if result is not None:
             result = _object(result, "tool result", 2 * 1024 * 1024)
         if error is not None:
             _text(error, "tool error", 8000)
+        if stop_reason is not None:
+            _text(stop_reason, "stop reason", 1000)
         encoded = canonical(result) if result is not None else None
         with self._db(True) as db:
             self._refresh(db)
@@ -555,6 +562,8 @@ class GenericStore:
             if row["state"] in ("succeeded", "failed"):
                 if (row["result"], row["error"]) != (encoded, error):
                     raise ValueError("Completed effect is immutable")
+                if stop_reason is not None and db.execute("SELECT status FROM campaign WHERE id=1").fetchone()[0] == "active":
+                    self._stop_in_transaction(db, stop_reason)
                 return {**self._effect(row), "duplicate": True}
             if row["state"] != "running":
                 db.commit()
@@ -565,6 +574,8 @@ class GenericStore:
                        (state, time.time(), encoded, error, effect_id))
             self._event(db, "effect_completed", {"effect_id": effect_id, "state": state,
                                                 "result_sha256": digest(result) if result is not None else None})
+            if stop_reason is not None:
+                self._stop_in_transaction(db, stop_reason)
             return self._effect(db.execute("SELECT * FROM effects WHERE id=?", (effect_id,)).fetchone())
 
     def effect(self, effect_id: str) -> dict:
@@ -699,12 +710,16 @@ class GenericStore:
                     "expired_leases": recovery["expired_leases"],
                     "interrupted_effects": recovery["interrupted_effects"]}
 
+    def _stop_in_transaction(self, db, reason: str):
+        """Apply host stop policy inside the caller's existing write transaction."""
+        db.execute("UPDATE campaign SET status='stopped',reason=? WHERE id=1", (reason,))
+        self._refresh(db)
+        self._event(db, "campaign_stopped", {"reason": reason})
+
     def stop(self, reason: str = "stopped_by_owner"):
         _text(reason, "stop reason", 1000)
         with self._db(True) as db:
-            db.execute("UPDATE campaign SET status='stopped',reason=? WHERE id=1", (reason,))
-            self._refresh(db)
-            self._event(db, "campaign_stopped", {"reason": reason})
+            self._stop_in_transaction(db, reason)
 
     def context(self) -> dict:
         with self._db(True) as db:
