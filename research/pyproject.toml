@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infinity-research-backend"
+version = "0.1.0"
+description = "Durable experiment and evidence backend for Infinity research agents"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+filament = ["numpy>=1.26,<3", "Pillow>=10,<13", "pycocotools>=2.0.7,<3"]
+
+[project.scripts]
+infinity-research-task = "infinity_research.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["infinity_research*"]

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "task_id": "filament-segmentation-2026",
+  "domain": "filament",
+  "description": "Improve solar filament instance segmentation using only competition training annotations. Propose distinct hypotheses, train candidates, and compare independent grouped-validation PQ. Preserve a final holdout for one fixed-candidate evaluation.",
+  "objective": {"name": "solar_pq_v6", "direction": "maximize"},
+  "data": {"prepared_root": "./data/filament-prepared"},
+  "baseline": "baseline.py",
+  "executor": {
+    "kind": "docker", "image": "infinity-research-filament:local",
+    "cpus": 4, "memory_mb": 8192, "gpus": 1, "gpu_devices": ["0"], "max_output_mb": 1024
+  },
+  "budget": {
+    "max_workers": 8, "max_model_calls": 160, "max_output_tokens": 8192,
+    "max_experiments": 24, "max_parallel_experiments": 1,
+    "max_trial_seconds": 3600, "max_total_trial_seconds": 86400,
+    "max_wall_seconds": 172800, "final_trial_seconds": 3600
+  },
+  "search": {
+    "families": ["foreground_baseline", "instance_separation", "augmentation", "postprocessing", "architecture"],
+    "stagnation_trials": 8, "min_delta": 0.001
+  },
+  "sources": [
+    "https://www.kaggle.com/competitions/filament-segmentation-2026/overview",
+    "https://www.kaggle.com/code/azimahmadzadeh/self-evaluation-notebook",
+    "https://www.kaggle.com/competitions/filament-segmentation-2026/discussion/729396",
+    "https://www.kaggle.com/competitions/filament-segmentation-2026/rules"
+  ]
+}
