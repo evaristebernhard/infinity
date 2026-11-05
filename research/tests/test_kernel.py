@@ -605,5 +605,326 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(self.store.read_work(child)["goal"], goal)
 
 
+class HierarchyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.counter = 0
+        self.store = self.new_store("campaign")
+
+    def new_store(self, name, *, max_depth=2, max_children=3, **limits):
+        spec = contract(**{"max_workers": 4, **limits})
+        spec["delegation"] = {"max_depth": max_depth, "max_children_per_work": max_children}
+        spec["brief"] = {"subject": "math, competition, or invention research", "data_only": True}
+        return GenericStore.create(self.root / name, spec)
+
+    def op(self, name, args=None, *, owner="root-session", key=None):
+        self.counter += 1
+        return self.store.dispatch_work(name, args or {}, owner=owner,
+                                        request_key=key or f"{owner}:{self.counter}")
+
+    def claim(self, work_id="root", owner="root-session"):
+        self.store.bind_worker(owner, work_id)
+        return self.op("claim_work", {"work_id": work_id}, owner=owner)
+
+    @staticmethod
+    def lease(claim):
+        return {"work_id": claim["work_id"], "lease_token": claim["lease_token"]}
+
+    def delegate(self, claim, *, owner="root-session", goal="Explore a concrete alternative", **args):
+        return self.op("delegate_work", {**self.lease(claim), "goal": goal, **args}, owner=owner)["work_id"]
+
+    def wait(self, claim, children, *, owner="root-session", mode="all_settled"):
+        return self.op("wait_work", {**self.lease(claim), "depends_on": children, "join_mode": mode}, owner=owner)
+
+    def complete(self, claim, *, owner="root-session", result=None):
+        return self.op("complete_work", {**self.lease(claim), "result": result or {"status": "reported"}}, owner=owner)
+
+    def fail(self, claim, *, owner="root-session"):
+        return self.op("fail_work", {**self.lease(claim), "error": "This route did not work", "retry": False}, owner=owner)
+
+    def test_opt_in_contract_validates_bounds_without_changing_legacy_hash_input(self):
+        normalized = validate_contract(contract())
+        self.assertNotIn("delegation", normalized)
+        self.assertNotIn("max_parallel_model_calls", normalized["limits"])
+        for delegation in ({"max_depth": 3, "max_children_per_work": 3},
+                           {"max_depth": True, "max_children_per_work": 3},
+                           {"max_depth": 2, "max_children_per_work": 0},
+                           {"max_depth": 2, "max_children_per_work": 33},
+                           {"max_depth": 2}, None):
+            with self.subTest(delegation=delegation), self.assertRaises(ValueError):
+                validate_contract({**contract(), "delegation": delegation})
+        for slots in (0, 9, True, 1.5):
+            with self.subTest(slots=slots), self.assertRaises(ValueError):
+                validate_contract(contract(max_parallel_model_calls=slots))
+        self.assertEqual(validate_contract(contract(max_parallel_model_calls=2))["limits"]["max_parallel_model_calls"], 2)
+        zero = self.new_store("no-descendants", max_depth=0)
+        zero.bind_worker("root", "root")
+        claim = zero.dispatch_work("claim_work", {}, owner="root", request_key="claim")
+        with self.assertRaisesRegex(RuntimeError, "depth"):
+            zero.dispatch_work("delegate_work", {**self.lease(claim), "goal": "forbidden child"},
+                               owner="root", request_key="delegate")
+
+    def test_parent_depth_and_authority_are_host_derived_and_create_work_cannot_bypass(self):
+        root = self.claim()
+        child_id = self.delegate(root, brief={"delegation_depth": 0, "capabilities": ["not-a-grant"]})
+        child = self.claim(child_id, "child-session")
+        grandchild_id = self.delegate(child, owner="child-session")
+        grandchild = self.claim(grandchild_id, "grandchild-session")
+        self.assertEqual([root["work"]["delegation_depth"], child["work"]["delegation_depth"],
+                          grandchild["work"]["delegation_depth"]], [0, 1, 2])
+        self.assertEqual(child["work"]["delegation_parent_id"], "root")
+        self.assertEqual(grandchild["work"]["delegation_parent_id"], child_id)
+        self.assertFalse(grandchild["work"]["can_delegate"])
+        with self.assertRaisesRegex(RuntimeError, "depth"):
+            self.delegate(grandchild, owner="grandchild-session")
+        with self.assertRaisesRegex(ValueError, "host-derived"):
+            self.delegate(grandchild, owner="grandchild-session", delegation_depth=0)
+        with self.assertRaisesRegex(RuntimeError, "bound to another"):
+            self.delegate(root, owner="grandchild-session")
+        for parent in (None, "root", child_id):
+            with self.assertRaisesRegex(RuntimeError, "create_work is disabled"):
+                self.op("create_work", {"goal": "Bypass", "parent_id": parent}, owner="grandchild-session")
+        with self.store._db(True) as db:
+            with self.assertRaisesRegex(RuntimeError, "create_work is disabled"):
+                self.store._create_work(db, {"goal": "Host private-path bypass"})
+        self.assertEqual(sum(self.store.context()["work_counts"].values()), 3)
+
+    def test_bindings_are_immutable_and_required_for_every_lease_mutation(self):
+        with self.assertRaisesRegex(RuntimeError, "not bound"):
+            self.op("claim_work")
+        root = self.claim()
+        child_id = self.delegate(root)
+        self.store.bind_worker("child-session", child_id)
+        with self.assertRaisesRegex(RuntimeError, "immutable"):
+            self.store.bind_worker("child-session", "root")
+        with self.assertRaisesRegex(RuntimeError, "bound to another"):
+            self.op("claim_work", {"work_id": "root"}, owner="child-session")
+        for operation, extra in (("renew_work", {}), ("delegate_work", {"goal": "illegal"}),
+                                 ("wait_work", {"depends_on": [child_id]}),
+                                 ("complete_work", {"result": {}}), ("fail_work", {"error": "fail"})):
+            with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "not bound"):
+                self.op(operation, {**self.lease(root), **extra}, owner="unbound-session")
+        with self.assertRaisesRegex(RuntimeError, "not bound"):
+            self.store.reserve_effect("unbound-session", "root", root["lease_token"], "exact_check", {}, "unbound-effect")
+        with self.assertRaisesRegex(RuntimeError, "not bound"):
+            self.store.renew_live_leases(["unbound-session"])
+        with self.assertRaisesRegex(ValueError, "Unknown work operation"):
+            self.op("bind_worker", {"owner": "child-session", "work_id": "root"})
+
+    def test_concurrent_delegation_enforces_lifetime_quota_and_idempotent_replays(self):
+        root = self.claim()
+
+        def submit(index):
+            arguments = {**self.lease(root), "goal": f"Alternative {index}"}
+            try:
+                result = GenericStore(self.store.root).dispatch_work("delegate_work", arguments,
+                            owner="root-session", request_key=f"parallel-child-{index}")
+                return index, arguments, result
+            except RuntimeError as error:
+                return str(error)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            outcomes = list(pool.map(submit, range(24)))
+        accepted = [item for item in outcomes if isinstance(item, tuple)]
+        self.assertEqual(len(accepted), 3)
+        self.assertTrue(all("Lifetime child limit" in item for item in outcomes if isinstance(item, str)))
+        index, arguments, first = accepted[0]
+        replay = self.op("delegate_work", arguments, key=f"parallel-child-{index}")
+        self.assertEqual(replay["work_id"], first["work_id"])
+        for index, _, result in accepted:
+            child = self.claim(result["work_id"], f"child-{index}")
+            self.fail(child, owner=f"child-{index}")
+        self.store = GenericStore(self.store.root)
+        self.assertEqual(self.store.read_work("root")["children_count"], 3)
+        self.assertEqual(self.store.read_work("root")["remaining_child_slots"], 0)
+        with self.assertRaisesRegex(RuntimeError, "Lifetime child limit"):
+            self.delegate(root)
+        self.wait(root, [result["work_id"] for _, _, result in accepted])
+        resumed = self.claim()
+        with self.assertRaisesRegex(RuntimeError, "Lifetime child limit"):
+            self.delegate(resumed)
+
+    def test_one_global_slot_runs_two_levels_and_merges_a_failed_route(self):
+        spec = contract(max_workers=1, max_parallel_model_calls=1)
+        spec["delegation"] = {"max_depth": 2, "max_children_per_work": 3}
+        self.store = GenericStore.create(self.root / "one-slot", spec)
+        root = self.claim()
+        child_id = self.delegate(root)
+        self.assertEqual(self.claim(child_id, "child-session")["reason"], "worker_capacity_busy")
+        self.wait(root, [child_id])
+        self.assertEqual(self.store.context()["work_counts"]["leased"], 0)
+        child = self.claim(child_id, "child-session")
+        grandchild_id = self.delegate(child, owner="child-session")
+        self.assertEqual(self.claim(grandchild_id, "grandchild-session")["reason"], "worker_capacity_busy")
+        self.wait(child, [grandchild_id], owner="child-session")
+        grandchild = self.claim(grandchild_id, "grandchild-session")
+        self.fail(grandchild, owner="grandchild-session")
+        child_resumed = self.claim(child_id, "child-session")
+        self.assertEqual(child_resumed["work"]["failure_count"], 0)
+        self.assertEqual(self.store.read_work(grandchild_id)["state"], "failed")
+        self.complete(child_resumed, owner="child-session", result={"route": "failed; report evidence"})
+        root_resumed = self.claim()
+        completed = self.complete(root_resumed, result={"status": "unresolved"})
+        self.assertEqual(completed["result_status"], "agent_authored_not_independently_verified")
+        context = self.store.context()
+        self.assertEqual(context["stop_reason"], "work_graph_completed")
+        self.assertEqual(context["work_counts"]["failed"], 1)
+        self.assertEqual(context["budget"]["max_parallel_model_calls"], 1)
+
+    def test_all_success_still_blocks_a_parent_after_a_terminal_failed_child(self):
+        root = self.claim()
+        child_id = self.delegate(root)
+        self.wait(root, [child_id], mode="all_success")
+        child = self.claim(child_id, "child-session")
+        self.fail(child, owner="child-session")
+        self.assertEqual(self.store.read_work("root")["state"], "blocked")
+        self.assertEqual(self.store.context()["stop_reason"], "root_work_blocked")
+
+    def test_terminal_root_failure_closes_new_work_but_drains_admitted_effects(self):
+        root = self.claim()
+        child_id = self.delegate(root)
+        child = self.claim(child_id, "child-session")
+        queued_grandchild = self.delegate(child, owner="child-session")
+        effect = self.store.reserve_effect("child-session", child_id, child["lease_token"],
+                                           "exact_check", {}, "already-admitted")
+        self.fail(root)
+        context = self.store.context()
+        self.assertEqual(context["stop_reason"], "root_work_failed")
+        self.assertTrue(context["draining"])
+        self.assertEqual(self.store.read_work(queued_grandchild)["state"], "cancelled")
+        self.assertEqual(self.store.read_work(child_id)["state"], "leased")
+        with self.assertRaisesRegex(RuntimeError, "admission closed: root_work_failed"):
+            self.delegate(child, owner="child-session")
+        with self.assertRaisesRegex(RuntimeError, "admission closed: root_work_failed"):
+            self.store.reserve_effect("child-session", child_id, child["lease_token"],
+                                       "exact_check", {}, "forbidden-new-effect")
+        completed = self.store.finish_effect(effect["id"], "child-session", child_id, child["lease_token"],
+                                            result={"judgement": "unknown", "note": "admitted work drained"})
+        self.assertEqual(completed["state"], "succeeded")
+        self.complete(child, owner="child-session")
+        self.assertEqual(self.store.context()["stop_reason"], "root_work_failed")
+        self.assertFalse(self.store.context()["draining"])
+
+    def test_hierarchy_wait_replaces_the_old_failed_batch_but_flat_wait_accumulates(self):
+        for hierarchical in (True, False):
+            with self.subTest(hierarchical=hierarchical):
+                self.store = (self.new_store("second-hierarchy") if hierarchical
+                              else GenericStore.create(self.root / "flat-batches", contract()))
+                if hierarchical:
+                    root = self.claim()
+                    first = self.delegate(root)
+                else:
+                    root = self.op("claim_work", {"work_id": "root"})
+                    first = self.op("create_work", {"goal": "First route"})["work_id"]
+                self.wait(root, [first])
+                child = (self.claim(first, "first-session") if hierarchical else
+                         self.op("claim_work", {"work_id": first}, owner="first-session"))
+                self.fail(child, owner="first-session")
+                root = (self.claim() if hierarchical else self.op("claim_work", {"work_id": "root"}))
+                second = (self.delegate(root) if hierarchical else
+                          self.op("create_work", {"goal": "Replacement route"})["work_id"])
+                self.wait(root, [second], mode="all_success")
+                current = self.store.read_work("root")
+                self.assertEqual(set(current["depends_on"]), {second} if hierarchical else {first, second})
+                self.assertEqual(current["state"], "pending" if hierarchical else "blocked")
+                child = (self.claim(second, "second-session") if hierarchical else
+                         self.op("claim_work", {"work_id": second}, owner="second-session"))
+                self.complete(child, owner="second-session")
+                if hierarchical:
+                    resumed = self.claim()
+                    self.assertEqual(resumed["work"]["children_count"], 2)
+                    self.complete(resumed)
+                    self.assertEqual(self.store.context()["stop_reason"], "work_graph_completed")
+                else:
+                    self.assertEqual(self.store.context()["stop_reason"], "work_graph_exhausted")
+
+    def test_cycles_include_implicit_parent_joins_before_a_parent_explicitly_waits(self):
+        root = self.claim()
+        first = self.delegate(root, goal="A")
+        second = self.delegate(root, goal="B")
+        a = self.claim(first, "a-session")
+        self.wait(a, [second], owner="a-session")
+        b = self.claim(second, "b-session")
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            self.delegate(b, owner="b-session", depends_on=[first])
+        self.assertEqual(self.store.read_work(second)["children_count"], 0)
+        grandchild_id = self.delegate(b, owner="b-session")
+        grandchild = self.claim(grandchild_id, "grandchild-session")
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            self.wait(grandchild, [first], owner="grandchild-session")
+        self.assertEqual(self.store.read_work(grandchild_id)["state"], "leased")
+        self.assertEqual(self.store.read_work(grandchild_id)["depends_on"], [])
+        with self.assertRaisesRegex(ValueError, "itself"):
+            self.delegate(root, depends_on=["root"])
+        self.assertEqual(self.store.read_work("root")["children_count"], 2)
+
+    def test_completion_checks_live_grandchildren_even_if_the_direct_child_failed(self):
+        root = self.claim()
+        child_id = self.delegate(root)
+        child = self.claim(child_id, "child-session")
+        grandchild_id = self.delegate(child, owner="child-session")
+        self.fail(child, owner="child-session")
+        self.assertEqual(self.store.read_work(child_id)["state"], "failed")
+        with self.assertRaisesRegex(RuntimeError, "descendants are unfinished"):
+            self.complete(root)
+        grandchild = self.claim(grandchild_id, "grandchild-session")
+        with self.assertRaisesRegex(RuntimeError, "descendants are unfinished"):
+            self.complete(root)
+        self.complete(grandchild, owner="grandchild-session")
+        self.complete(root)
+        self.assertEqual(self.store.context()["stop_reason"], "work_graph_completed")
+
+    def test_restart_keeps_hierarchy_bindings_and_seals_brief_as_data(self):
+        root = self.claim()
+        brief = {"question": "Check a construction", "nested": {"depth": 0}, "tools": ["not-permission"]}
+        child_id = self.delegate(root, brief=brief, skill_names=["evidence-review"])
+        before = (self.store.root / "task.json").read_bytes()
+        with patch("infinity_research.kernel.time.time", return_value=root["lease_expires"] + 1):
+            self.store = GenericStore(self.store.root)
+            self.store.bind_worker("replacement-root", "root")
+            resumed = self.op("claim_work", {}, owner="replacement-root")
+            self.assertEqual(resumed["work"]["children_count"], 1)
+            self.assertEqual(resumed["work"]["delegation_depth"], 0)
+            with self.assertRaisesRegex(RuntimeError, "lease lost"):
+                self.op("renew_work", self.lease(root))
+            with self.assertRaisesRegex(RuntimeError, "immutable"):
+                self.store.bind_worker("root-session", child_id)
+            child = self.claim(child_id, "child-session")
+            self.assertEqual(child["work"]["brief"], brief)
+            self.assertEqual(child["work"]["delegation_depth"], 1)
+        self.assertEqual((self.store.root / "task.json").read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            self.delegate(child, owner="child-session", brief="not a data object")
+        with self.assertRaisesRegex(ValueError, "32768"):
+            self.delegate(child, owner="child-session", brief={"text": "x" * 32768})
+
+    def test_legacy_database_migration_preserves_contract_hash_and_lineage_semantics(self):
+        self.store = GenericStore.create(self.root / "legacy", contract())
+        root = self.op("claim_work")
+        child = self.op("create_work", {"goal": "Legacy child", "parent_id": "root"})["work_id"]
+        self.wait(root, [child], mode="all_success")
+        task_bytes = (self.store.root / "task.json").read_bytes()
+        with sqlite3.connect(self.store.path) as db:
+            task_hash = db.execute("SELECT task_hash FROM campaign").fetchone()[0]
+            for table in ("worker_bindings", "delegations", "work_policies"):
+                db.execute(f"DROP TABLE {table}")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            migrated = list(pool.map(lambda _: GenericStore(self.store.root), range(8)))
+        self.store = migrated[0]
+        self.assertEqual((self.store.root / "task.json").read_bytes(), task_bytes)
+        with sqlite3.connect(self.store.path) as db:
+            self.assertEqual(db.execute("SELECT task_hash FROM campaign").fetchone()[0], task_hash)
+        self.assertNotIn("delegation", self.store.context())
+        self.assertNotIn("max_parallel_model_calls", self.store.spec["limits"])
+        self.assertNotIn("delegation_depth", self.store.read_work(child))
+        self.assertEqual(self.store.read_work(child)["parent_id"], "root")
+        self.assertEqual(self.store.read_work("root")["join_mode"], "all_success")
+        child_claim = self.op("claim_work", {"work_id": child}, owner="any-unbound-flat-worker")
+        self.complete(child_claim, owner="any-unbound-flat-worker")
+        self.assertEqual(self.store.context()["ready_work_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

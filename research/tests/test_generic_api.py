@@ -255,6 +255,69 @@ class GenericApiTests(unittest.TestCase):
         self.assertEqual(result["result"]["evidence"]["judgement"], "unverified")
         self.assertFalse(self.store.context()["stop"])
 
+    def test_hierarchy_api_uses_host_binding_and_waits_with_one_execution_slot(self):
+        spec = task_contract()
+        spec["delegation"] = {"max_depth": 2, "max_children_per_work": 3}
+        spec["brief"] = {"deliverable": "A checked construction and explicit failed routes"}
+        spec["limits"].update(max_workers=1, max_parallel_model_calls=1)
+        task = self.root / "hierarchy.json"
+        task.write_text(json.dumps(spec))
+        self.store = generic_api.initialize(task, self.root / "hierarchy", allow_local=True)
+        catalog = {item["name"] for item in generic_api.context(self.store)["tool_catalog"]}
+        self.assertIn("delegate_work", catalog)
+        self.assertNotIn("create_work", catalog)
+        self.assertNotIn("bind_worker", catalog)
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            self.invoke("bind_worker", {"owner": "native-thread-1", "work_id": "root"})
+        with self.assertRaisesRegex(RuntimeError, "not bound"):
+            self.claim()
+
+        # Host binding goes through the same subprocess operation used by Rust.
+        research = Path(__file__).resolve().parents[1]
+        binding = subprocess.run([sys.executable, "-m", "infinity_research.rpc", "--campaign",
+                                  str(self.store.root), "bind_worker"],
+                                 input=json.dumps({"owner": "native-thread-1", "work_id": "root"}),
+                                 text=True, capture_output=True, check=False, timeout=10, cwd=research)
+        self.assertEqual(binding.returncode, 0, binding.stderr)
+        self.assertTrue(json.loads(binding.stdout)["result"]["bound"])
+        root = self.claim()
+        self.assertEqual(root["work"]["delegation_depth"], 0)
+        self.assertEqual(root["work"]["brief"], spec["brief"])
+        with self.assertRaisesRegex(ValueError, "Unexpected tool arguments"):
+            self.invoke("delegate_work", {**self.lease(root), "goal": "Spoof depth", "depth": 0})
+        child = self.invoke("delegate_work", {**self.lease(root), "goal": "Construct and check",
+                                             "brief": {"n": 4, "deliverable": "effect ID"}})
+        self.invoke("wait_work", {**self.lease(root), "depends_on": [child["work_id"]],
+                                  "join_mode": "all_settled"})
+        generic_api.dispatch(self.store, "bind_worker", {"owner": "child", "work_id": child["work_id"]})
+        child_claim = self.invoke("claim_work", owner="child")
+        with self.assertRaisesRegex(RuntimeError, "bound to another"):
+            self.invoke("claim_work", {"work_id": "root"}, owner="child")
+        grandchild = self.invoke("delegate_work", {**self.lease(child_claim), "goal": "Independent check"},
+                                 owner="child")
+        self.invoke("wait_work", {**self.lease(child_claim), "depends_on": [grandchild["work_id"]]},
+                    owner="child")
+        generic_api.dispatch(self.store, "bind_worker", {"owner": "leaf", "work_id": grandchild["work_id"]})
+        leaf_claim = self.invoke("claim_work", owner="leaf")
+        self.assertEqual(leaf_claim["work"]["delegation_depth"], 2)
+        with self.assertRaisesRegex(RuntimeError, "depth"):
+            self.invoke("delegate_work", {**self.lease(leaf_claim), "goal": "Forbidden great-grandchild"},
+                        owner="leaf")
+        checked = self.invoke("verify_square_packing", {**self.lease(leaf_claim), "arguments": grid()}, owner="leaf")
+        self.invoke("complete_work", {**self.lease(leaf_claim), "result": {"checked": checked["id"]},
+                                      "effect_ids": [checked["id"]]}, owner="leaf")
+        resumed_child = self.invoke("claim_work", owner="child")
+        self.assertNotEqual(resumed_child["lease_token"], child_claim["lease_token"])
+        self.invoke("fail_work", {**self.lease(resumed_child), "error": "This route was abandoned after checking",
+                                  "retry": False}, owner="child")
+        resumed_root = self.claim()
+        self.assertTrue(resumed_root["claimed"])
+        self.assertEqual(self.invoke("read_work", {"work_id": child["work_id"]})["state"], "failed")
+        self.invoke("complete_work", {**self.lease(resumed_root), "result": {"scope": "Partial checked result"},
+                                      "effect_ids": [checked["id"]]})
+        self.assertEqual(self.store.context()["stop_reason"], "work_graph_completed")
+        self.assertEqual(self.store.context()["objective_status"], "not_inferred_from_work_completion")
+
 
 if __name__ == "__main__":
     unittest.main()

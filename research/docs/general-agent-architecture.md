@@ -48,7 +48,7 @@ flowchart TB
 与方法可以复用，具体目标和执行历史属于一次任务。用户仓库
 `evaristebernhard/hyperagents` 是该产品界面的独立实现，与 Meta 论文项目不同。
 
-这一版先提供共同的 worker 池和任务指定 skill；还没有实现每个角色独立的模型
+平面模式提供共同的 worker 池；可选分层模式为每个委派目标创建独立对话，二者均支持任务指定 skill。还没有实现每个角色独立的模型
 路由、持久个人记忆或能力子集配置。以后可以加 `WorkerProfile`，但不会让一个
 角色永久等同于某场 Kaggle 比赛。
 
@@ -95,6 +95,9 @@ agent 可以发现和读取它们；不会在后台运行 `npx` 安装最新版�
 
 ## 3. 工作如何并行展开
 
+schema 2 有两种组织方式。没有 `delegation` 字段时，沿用平面 worker 池，
+不同工作可由同一 worker 先后领取；以下四步描述这一模式。
+
 每个 worker 先领取一项 ready work。一次领取返回 `work_id`、`lease_token`、
 到期时间和已有上下文。worker 可以：
 
@@ -103,10 +106,16 @@ agent 可以发现和读取它们；不会在后台运行 `npx` 安装最新版�
 3. 用 `wait_work` 把当前任务的依赖指向这些子任务，释放执行权；
 4. 子任务成功后，由一个可用 worker 重新领取父任务，汇合结果。
 
-`parent_id` 只表示来源，`depends_on` 才表示必须等待的前置条件。添加依赖时检查
-环路。当前依赖采用全成功语义；任一必需前置任务终止失败，会向后传播 `blocked`。
-可修复错误先在该工作内部重试。OR 路线、失败后由汇合节点选择幸存分支、可编辑
-图和形式化证明 AND/OR 图是后续能力，当前不冒充已有。
+平面模式的 `parent_id` 只表示来源，`depends_on` 表示等待条件。默认依赖采用
+`all_success`，任一必需前置任务终止失败会传播 `blocked`。可显式选 `all_settled`，
+所有分支终止后恢复父任务，由 agent 读取成功与失败并决定后续路线；这不是自动
+证明推理或任一成功立即返回的 OR 运算。平面模式多次等待累积依赖。
+
+配置 `delegation` 后，host 将每个逻辑工作绑定到自己的原生对话，使用 `delegate_work`
+而非 `create_work`。父关系、深度与终身孩子名额由宿主事务检查，最大深度为 2。
+`wait_work` 释放父租约并暂停对话，孩子结束后同一对话收到新的 `resume_claim`。
+分层模式每次等待替换等待集合；完成父工作前必须没有未结束的后代。详细配置与
+单槽推进方式见 [分层设计](hierarchical-agents.md)。
 
 配置 100 个 worker 是一个可用池。有 2 项工作就只唤醒足够的空闲 worker；没有
 ready work 时保持等待，不让 100 个 agent 每两秒互相报告“还没结果”。同一 worker
@@ -135,7 +144,7 @@ Rust 的工具枚举加一个比赛名称。
 
 | 工具组 | 现有接口 |
 | --- | --- |
-| 工作图 | `create_work`、`claim_work`、`renew_work`、`wait_work`、`complete_work`、`fail_work`、`read_work`、`list_work` |
+| 工作图 | 平面 `create_work` / 分层 `delegate_work`；共同使用 `claim_work`、`renew_work`、`wait_work`、`complete_work`、`fail_work`、`read_work`、`list_work` |
 | 状态与方法 | `research_context`、`list_skills`、`read_skill` |
 | 证据与产物 | `list_effects`、`read_effect`、`read_artifact` |
 | 通用执行 | `run_python` |
@@ -163,6 +172,7 @@ campaign，不能悄悄把前后两个版本的结果混在一起。宿主负责
 | 类别 | Skill | 用途 |
 | --- | --- | --- |
 | 共用研究步骤 | `research-decomposition` | 目标、可并行路线、依赖和汇合 |
+| 共用研究步骤 | `hierarchical-delegation` | 两次向下委派、具体简报、等待与失败汇合 |
 | 共用研究步骤 | `source-research` | 一手资料、版本和可追溯结论 |
 | 共用研究步骤 | `experiment-design` | 对照、消融、复现和失败解释 |
 | 共用研究步骤 | `evidence-review` | 检查结论与证据适用范围是否一致 |
@@ -174,6 +184,9 @@ campaign，不能悄悄把前后两个版本的结果混在一起。宿主负责
 | 工程方法 | `code-debugging` | 从可复现失败中定位原因 |
 | 工程方法 | `reproduce-result` | 固定输入、版本和重新运行条件 |
 | 方法改进 | `strategy-evolution` | 对照试验新 skill、搜索策略或工具组合 |
+| 技术资料 | `patent-research` | 可追溯检索、来源版本与技术特征对照 |
+| 技术资料 | `technical-disclosure` | 技术特征台账、交底草稿与证据缺口 |
+| 技术资料 | `claim-support-review` | 固定草稿版本、特征支持矩阵与独立复核 |
 
 正文平均只有几十行，长一点的领域陷阱、证据类型和策略对照协议在引用文件里。
 全部正文是本仓库编写的内容，没有拷贝第三方 skill 包。每个任务可只选择相关
@@ -206,6 +219,7 @@ campaign，尚无自动晋级服务。也未训练新的模型权重。
 | 定理证明 | 同一内核、任务和产物 | 形式化目标、证明器工具链、允许公理、证明依赖图 |
 | 算法研究 | 同一内核与执行工具 | 基准实例、独立实现、正确性条件、计时方式 |
 | 软件任务 | 同一工作与恢复机制 | checkout、构建、测试、补丁与集成工具 |
+| 技术交底与专利研究 | 同一分层委派、工作和证据 | 检索工具、来源资料、技术特征及支持矩阵 |
 
 已有 Solar Filament 的 schema 1 执行链保持原样，包括一次留出集评测。
 它尚未作为 schema 2 的 `train/evaluate/export` 能力包接入。下一步迁移应该包住
@@ -214,9 +228,11 @@ campaign，尚无自动晋级服务。也未训练新的模型权重。
 ## 8. 当前完成范围
 
 已实现：通用持久工作图、领取/续租/等待/重试、工具调用登记与旧结果隔离、动态
-工具目录、skill 快照与按需加载、通用 Python 执行、精确几何检查、原生 worker
-按需求唤醒，以及两种 task schema 并存。示例入口见
-[generic-research](../examples/generic-research/README.md)。
+工具目录、16 个 skill 的快照与按需加载、通用 Python 执行、精确几何检查、原生 worker
+按需求唤醒，以及两种 task schema 并存。可选分层模式还提供宿主绑定、两次委派上限、
+独立对话与暂停恢复，以及允许失败的汇合。示例入口见
+[generic-research](../examples/generic-research/README.md) 和
+[hierarchical-research](../examples/hierarchical-research/README.md)。
 
 仍需实现：跨机器队列、独立角色模型路由、持久对话恢复、自动 skill 晋级、Lean
 适配、全规模 packing 档案、Kaggle 能力桥接及外部工具结果查询。当前已保存

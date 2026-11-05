@@ -8,14 +8,15 @@ Kaggle result or a long-duration production campaign.
 
 | Check | Result |
 | --- | --- |
-| Python backend, kernel, skills, tools, executor and domain tests | 129 passed, including optional pycocotools interoperability |
-| Native `infinity-research` tests | 17 passed |
+| Python backend, kernel, skills, tools, executor and domain tests | 142 passed, including optional pycocotools interoperability |
+| Native `infinity-research` tests | 24 passed |
 | `cargo clippy -p infinity-research --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --all --check` | Passed |
 | Native launcher `--help` | Passed |
 | Standalone exact square-packing example | Six self-checks passed; exact certificates generated for n=4 and n=5 |
 | Generic offline composition | Three work items completed, three real tool effects, actual Python execution plus independent exact n=4/n=5 checks |
-| Packaged skill resources | Built and extracted a wheel; all 12 skills and three references loaded outside the source checkout |
+| Packaged skill resources | Built and extracted a wheel; all 16 skills and seven references loaded outside the source checkout |
+| Hierarchical example configurations | Math and fictional technical-disclosure tasks initialize, seal their contracts and load the selected skill/tool catalogs |
 | `git diff --check` | Passed |
 | Repository `./check.bash` | Local entry point stops at missing `jj`; scoped tests above ran separately. GitHub's full CI is the separate merge gate |
 
@@ -31,6 +32,50 @@ cargo fmt --all --check
 ```
 
 ## What the tests exercise
+
+### Bounded hierarchical campaigns
+
+Schema 2 can opt into root depth 0, child depth 1 and grandchild depth 2. The
+Python suite now includes 41 kernel tests and 12 composed API tests. Hierarchy
+regressions check host-only immutable owner/work binding, ancestor-claim and
+forged-depth rejection, blocked `create_work` bypasses, transactionally enforced
+lifetime child limits, and unchanged limits after failures and restarts.
+Twenty-four concurrent delegation requests create exactly three children when
+the parent limit is three.
+
+The composed API test uses the actual subprocess `bind_worker` RPC, then runs
+root → child → grandchild with one work slot. The leaf performs a real exact
+packing check. The parent route subsequently fails; the root resumes through
+`all_settled` and retains the actual evidence without treating workflow success
+as proof. Waiting uses a fresh lease, not the token from the previous attempt.
+
+Kernel tests also cover implicit descendant-join cycles, replacing a previous
+failed wait batch in hierarchy mode, retaining legacy cumulative waits, and
+refusing parent completion while any descendant remains open. A permanently
+failed or blocked root closes new work/tool admission and cancels pending work;
+already admitted tool effects can finish. Intermediate failed branches do not
+stop unrelated research. Concurrent opens of an old database add metadata tables
+without changing the sealed task bytes/hash or reinterpreting legacy parent IDs.
+
+Six native integration scenarios use actual Infinity conversations and the real
+Python RPC backend. They cover a single-slot root/child/grandchild chain, a failed
+branch joined with `all_settled`, independent child contexts and same-context
+parent resumption, depth-limit rejection, and repeated exact checks at a leaf.
+Another scenario observes a global peak of two simultaneous model streams across
+independent logical agents. Stop tests settle parked parents after owner stop or
+a fatal child model error, and preserve a normal owner-stop reason when it races
+the host claim. A separate native unit test closes the real Infinity input queue
+and verifies that failed join delivery is fatal and all pending callbacks clear.
+
+A deterministic barrier test holds a retrying parent's model until the host has
+claimed its child. With a contract limit of four but launcher `--workers 1`, the
+parent's model-side `claim_work` returns `await_supervisor` rather than allocating
+another lease. The observed lease peak remains one. New hierarchy leases are
+admitted by the supervisor; model-side claims can only reread an existing one.
+
+These are implementation checks with scripted or direct calls. They do not
+establish autonomous mathematical discoveries, patent-search coverage or the
+quality of generated legal/technical drafts.
 
 ### Generic campaigns
 

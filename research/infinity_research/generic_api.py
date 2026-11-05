@@ -21,9 +21,13 @@ _LEASE = {"work_id": _STRING, "lease_token": _STRING}
 _WORK_SCHEMAS = {
     "create_work": _object({"goal": _STRING, "parent_id": {"type": ["string", "null"]},
                             "depends_on": _IDS, "skill_names": _IDS}, ("goal",)),
+    "delegate_work": _object({**_LEASE, "goal": _STRING, "brief": {"type": "object"},
+                              "depends_on": _IDS, "skill_names": _IDS}, (*_LEASE, "goal")),
     "claim_work": _object({"work_id": _STRING}),
     "renew_work": _object(_LEASE, _LEASE),
-    "wait_work": _object({**_LEASE, "depends_on": _IDS}, (*_LEASE, "depends_on")),
+    "wait_work": _object({**_LEASE, "depends_on": _IDS,
+                           "join_mode": {"type": "string", "enum": ["all_success", "all_settled"]}},
+                          (*_LEASE, "depends_on")),
     "complete_work": _object({**_LEASE, "result": {"type": "object"}, "effect_ids": _IDS},
                              (*_LEASE, "result")),
     "fail_work": _object({**_LEASE, "error": _STRING, "retry": {"type": "boolean"}},
@@ -34,9 +38,10 @@ _WORK_SCHEMAS = {
 }
 _WORK_HELP = {
     "create_work": "Persist a concrete goal with optional existing dependencies and parent provenance. Does not spawn an unbounded agent or change its parent's dependencies.",
+    "delegate_work": "Delegate a concrete goal to a child logical agent. Requires your current work lease; the host derives parent and depth, enforces lifetime child limits, and schedules an independent conversation. Include a focused brief, expected deliverable, acceptance criteria and actual evidence IDs. This does not wait for the child; use wait_work when you need its result.",
     "claim_work": "Atomically claim one ready goal, or return your existing active lease. Save work_id and lease_token. If nothing is ready, end the turn and wait for the supervisor.",
     "renew_work": "Renew your current work lease before it expires. An expired or replaced token cannot be renewed.",
-    "wait_work": "Release your lease and wait for existing prerequisite goals to succeed. Use after creating child work. Cycles are rejected; a failed prerequisite blocks this goal.",
+    "wait_work": "Release your lease while waiting for dependencies. all_success requires every dependency to succeed; all_settled waits for every dependency to end and lets you inspect failures. Cycles are rejected. In a hierarchical campaign this replaces the current wait set, parks the conversation without using a model slot, and later returns resume_claim with a new lease token.",
     "complete_work": "Finish workflow work with an agent-authored result and actual tool effect IDs. This does not establish a mathematical proof or independently validate the result.",
     "fail_work": "Record a failed attempt and optionally requeue within the host retry limit. Include the observed failure; unavailable tools or exhausted routes must remain explicit.",
     "read_work": "Read a goal, dependencies, attempts and persisted result. The lease token is visible only to its current owner.",
@@ -52,8 +57,18 @@ def _skills(store):
 
 def tool_catalog(spec):
     from .capabilities import capability_catalog
+    hierarchical = "delegation" in spec
+    hidden = "create_work" if hierarchical else "delegate_work"
     result = [{"name": name, "description": _WORK_HELP[name], "parameters": schema}
-              for name, schema in _WORK_SCHEMAS.items()]
+              for name, schema in _WORK_SCHEMAS.items() if name != hidden]
+    if hierarchical:
+        for definition in result:
+            if definition["name"] == "claim_work":
+                definition["description"] = (
+                    "Read the supervisor-acquired lease of the logical agent work assigned to this conversation. "
+                    "The native runtime does not let this tool acquire a new lease or claim another agent's work. "
+                    "If no lease is available, end your turn for the supervisor to schedule you. It supplies "
+                    "your initial claim and a fresh resume_claim after wait_work.")
     result.extend([
         {"name": "research_context", "description": "Read the current goal, work availability, progress and the pinned skill/tool catalog.",
          "parameters": _object()},
@@ -156,7 +171,7 @@ def invoke(store, envelope):
     if name == "list_work":
         return store.list_work(**args)
     if name in _WORK_SCHEMAS:
-        if name == "create_work" and "skill_names" in args:
+        if name in {"create_work", "delegate_work"} and "skill_names" in args:
             if (not isinstance(args["skill_names"], list)
                     or any(skill not in store.spec["skills"] for skill in args["skill_names"])):
                 raise ValueError("Work references an unavailable skill")
@@ -212,6 +227,8 @@ def dispatch(store, operation, args):
         return store.recover()
     if operation == "heartbeat":
         return store.renew_live_leases(args["owners"])
+    if operation == "bind_worker":
+        return store.bind_worker(args["owner"], args["work_id"])
     if operation == "interrupt_tool":
         return store.interrupt_effect(args["owner"], args["request_key"], args["reason"])
     raise ValueError(f"Operation {operation!r} is not supported by a generic campaign")

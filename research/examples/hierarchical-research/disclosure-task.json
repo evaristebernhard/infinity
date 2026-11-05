@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "task_id": "fictional-technical-disclosure-workflow",
+  "goal": "Demonstrate a bounded technical-disclosure workflow using only the explicitly fictional input brief. Organize source-stated features and unknowns, prepare a draft disclosure and tentative claim outline, then ask a separate child to map each claim feature to its supplied or proposed support. Any literature or patent search remains a plan because this campaign has no search capability. Label every output as a fictional workflow demonstration, not a novelty conclusion, legal opinion or filing-ready invention. Preserve missing experiments and measurements as gaps.",
+  "brief": {
+    "fictional_example": true,
+    "provided_description": "A hypothetical cooling controller receives a temperature reading, applies a hysteresis rule with two unspecified thresholds, and switches a fan. The thresholds, hardware, sampling interval and failure behavior have not been specified.",
+    "source_id": "fictional-input-brief-v1",
+    "measured_results": [],
+    "provided_prior_art": [],
+    "deliverable": ["Feature ledger", "Disclosure draft", "Tentative claim outline", "Support matrix", "Missing information and unexecuted search plan"],
+    "acceptance_criteria": ["No invented measurements or publication identifiers", "Clearly separate given details, proposals and unknowns", "Each statement has a source or an explicit uncertainty label"]
+  },
+  "delegation": {"max_depth": 2, "max_children_per_work": 3},
+  "capabilities": [],
+  "skills": ["hierarchical-delegation", "research-decomposition", "patent-research", "technical-disclosure", "claim-support-review", "evidence-review"],
+  "limits": {
+    "max_workers": 4,
+    "max_parallel_model_calls": 2,
+    "max_parallel_tools": 1,
+    "max_work_items": 13,
+    "max_model_calls": 500,
+    "max_output_tokens": 8192,
+    "max_wall_seconds": 7200,
+    "max_failures": 4,
+    "lease_seconds": 300
+  }
+}
