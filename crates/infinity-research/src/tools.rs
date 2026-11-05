@@ -1,7 +1,7 @@
 //! Research operations registered as real asynchronous Infinity tools.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
-use rap_protocol::{ProviderCallId, ToolCallId};
+use rap_protocol::{ProviderCallId, ThreadId, ToolCallId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -22,6 +22,52 @@ pub struct ToolActivity {
     active: AtomicUsize,
     completed: AtomicU64,
     failure: Mutex<Option<String>>,
+    park_hierarchy_waits: AtomicBool,
+    pending_waits: Mutex<HashMap<String, PendingWait>>,
+    worker_bindings: Mutex<HashMap<String, String>>,
+}
+
+/// A successful durable join relinquishes its lease immediately. Keep only its
+/// native callback here, outside the active tool count, until the same logical
+/// agent is admitted again. Its conversation remains in Infinity's store.
+struct PendingWait {
+    work_id: String,
+    group_id: ThreadId,
+    id: ToolCallId,
+    call_id: Option<ProviderCallId>,
+    response: Value,
+}
+
+impl PendingWait {
+    async fn deliver(self, sender: &ChannelSender) -> Result<(), BoxError> {
+        let message = tool_reply(self.group_id, &self.id, self.call_id, self.response);
+        sender
+            .send_to_input_queue(message, self.id.as_str())
+            .await
+            .map_err(|error| format!("cannot deliver logical agent join: {error}").into())
+    }
+}
+
+fn tool_reply(
+    group_id: ThreadId,
+    id: &ToolCallId,
+    call_id: Option<ProviderCallId>,
+    response: Value,
+) -> InputMessage {
+    InputMessage {
+        content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+            id: id.as_str().to_owned(),
+            call_id: call_id.map(ProviderCallId::into_inner),
+            content: vec![ToolResultContent::Text(Text {
+                text: response.to_string(),
+            })],
+        })),
+        group_id,
+        metadata: None,
+        synthetic: None,
+        display_as: None,
+        subscription: false,
+    }
 }
 
 impl ToolActivity {
@@ -48,6 +94,149 @@ impl ToolActivity {
             .lock()
             .expect("bug: tool failure state poisoned")
             .get_or_insert(reason);
+    }
+
+    pub(crate) fn is_parked(&self, owner: &str) -> bool {
+        self.pending_waits
+            .lock()
+            .expect("bug: pending join state poisoned")
+            .contains_key(owner)
+    }
+
+    pub(crate) fn bind_worker(&self, owner: &str, work_id: &str) -> Result<(), BoxError> {
+        let mut bindings = self
+            .worker_bindings
+            .lock()
+            .expect("bug: native worker binding state poisoned");
+        if let Some(previous) = bindings.get(owner) {
+            if previous != work_id {
+                return Err("native logical agent binding cannot change".into());
+            }
+        } else {
+            bindings.insert(owner.to_owned(), work_id.to_owned());
+        }
+        Ok(())
+    }
+
+    /// In hierarchy mode only the supervisor admits a new lease. A model can
+    /// reread its host-bound lease but cannot race a retry against a new child
+    /// admission and exceed the launcher's smaller execution-slot limit.
+    async fn read_bound_claim(
+        &self,
+        backend: &dyn ResearchBackend,
+        envelope: &Value,
+    ) -> Result<Value, BoxError> {
+        let owner = envelope["owner"]
+            .as_str()
+            .ok_or("claim requires native owner")?;
+        let work_id = self
+            .worker_bindings
+            .lock()
+            .expect("bug: native worker binding state poisoned")
+            .get(owner)
+            .cloned()
+            .ok_or("hierarchy worker is not bound by the host")?;
+        let args = envelope["arguments"]
+            .as_object()
+            .ok_or("claim arguments must be an object")?;
+        if args.keys().any(|key| key != "work_id") {
+            return Err("unexpected claim arguments".into());
+        }
+        if args
+            .get("work_id")
+            .is_some_and(|requested| requested.as_str() != Some(work_id.as_str()))
+        {
+            return Err("Hierarchy worker is bound to another work item".into());
+        }
+        let mut read = envelope.clone();
+        read["tool"] = json!("read_work");
+        read["arguments"] = json!({"work_id": work_id});
+        let work = backend.call("invoke_tool", read).await?;
+        if work["state"] == "leased"
+            && work["lease_owner"] == owner
+            && work["lease_token"].as_str().is_some()
+        {
+            Ok(json!({"claimed": true, "work_id": work_id,
+                "lease_token": work["lease_token"], "lease_expires": work["lease_expires"], "work": work}))
+        } else {
+            Ok(json!({"claimed": false, "work_id": work_id, "reason": "await_supervisor"}))
+        }
+    }
+
+    fn park_wait(&self, wait: PendingWait) -> Result<(), BoxError> {
+        let mut pending = self
+            .pending_waits
+            .lock()
+            .expect("bug: pending join state poisoned");
+        if let Some(previous) = pending.get(wait.group_id.as_str()) {
+            if previous.id == wait.id && previous.work_id == wait.work_id {
+                return Ok(());
+            }
+            return Err("a logical agent already has an unanswered join".into());
+        }
+        pending.insert(wait.group_id.as_str().to_owned(), wait);
+        Ok(())
+    }
+
+    /// Deliver the original wait callback, with a newly admitted lease. No user
+    /// message interrupts the parent and no child transcript is copied to it.
+    pub(crate) async fn resume_wait(
+        &self,
+        owner: &str,
+        claim: &Value,
+        sender: &ChannelSender,
+    ) -> Result<bool, BoxError> {
+        let wait = self
+            .pending_waits
+            .lock()
+            .expect("bug: pending join state poisoned")
+            .remove(owner);
+        let Some(mut wait) = wait else {
+            return Ok(false);
+        };
+        if claim.get("work_id").and_then(Value::as_str) != Some(wait.work_id.as_str())
+            || claim.get("claimed").and_then(Value::as_bool) != Some(true)
+            || !wait.response["result"].is_object()
+        {
+            self.fail("join resume must carry a claim for the same logical agent".into());
+            return Err("join resume must carry a claim for the same logical agent".into());
+        }
+        wait.response["result"]["resume_claim"] = claim.clone();
+        if let Err(error) = wait.deliver(sender).await {
+            self.fail(error.to_string());
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Native drivers with an unanswered tool are live even when they consume
+    /// no inference slot. Settle those callbacks on stop so shutdown can finish.
+    pub(crate) async fn cancel_waits(
+        &self,
+        reason: &str,
+        sender: &ChannelSender,
+    ) -> Result<(), BoxError> {
+        let pending = std::mem::take(
+            &mut *self
+                .pending_waits
+                .lock()
+                .expect("bug: pending join state poisoned"),
+        );
+        let mut failure = None;
+        for (_, mut wait) in pending {
+            wait.response = json!({
+                "ok": false, "stopped": true, "error": reason,
+                "wait_result": wait.response["result"],
+            });
+            if let Err(error) = wait.deliver(sender).await {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            self.fail(error.to_string());
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -187,12 +376,31 @@ fn start_operation(
     let guard = ActivityGuard::new(activity.clone());
     tokio::spawn(async move {
         let _guard = guard;
+        let parked_work = (activity.park_hierarchy_waits.load(Ordering::SeqCst)
+            && operation == "invoke_tool"
+            && arguments.get("tool").and_then(Value::as_str) == Some("wait_work"))
+        .then(|| {
+            arguments["arguments"]["work_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .flatten();
         let interrupted_request = (operation == "invoke_tool").then(|| {
             json!({
                 "owner": arguments["owner"], "request_key": arguments["request_key"],
             })
         });
-        let response = match backend.call(operation, arguments).await {
+        let result = if activity.park_hierarchy_waits.load(Ordering::SeqCst)
+            && operation == "invoke_tool"
+            && arguments.get("tool").and_then(Value::as_str) == Some("claim_work")
+        {
+            activity
+                .read_bound_claim(backend.as_ref(), &arguments)
+                .await
+        } else {
+            backend.call(operation, arguments).await
+        };
+        let response = match result {
             Ok(result) => json!({"ok": true, "result": result}),
             Err(error) => {
                 tracing::warn!(%group_id, operation, %error, "research operation failed");
@@ -220,22 +428,25 @@ fn start_operation(
                 response
             }
         };
-        let message = InputMessage {
-            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
-                id: id.as_str().to_owned(),
-                call_id: call_id.map(ProviderCallId::into_inner),
-                content: vec![ToolResultContent::Text(Text {
-                    text: response.to_string(),
-                })],
-            })),
-            group_id,
-            metadata: None,
-            synthetic: None,
-            display_as: None,
-            subscription: false,
-        };
+        if let Some(work_id) = parked_work.filter(|_| response["ok"] == true) {
+            if let Err(error) = activity.park_wait(PendingWait {
+                work_id,
+                group_id,
+                id,
+                call_id,
+                response,
+            }) {
+                activity.fail(format!("cannot park logical agent join: {error}"));
+            }
+            // Dropping the activity guard releases the tool slot. In
+            // particular, do not deliver a successful wait yet: that would
+            // automatically call the model while its dependencies are pending.
+            return;
+        }
+        let message = tool_reply(group_id, &id, call_id, response);
         if let Err(error) = sender.send_to_input_queue(message, id.as_str()).await {
             tracing::error!(%error, tool_call_id = %id, "failed to deliver persisted tool result");
+            activity.fail(format!("cannot deliver persisted tool result: {error}"));
         }
     });
 }
@@ -293,6 +504,9 @@ pub fn campaign_tools(
     if context.get("run_kind").and_then(Value::as_str) != Some("generic") {
         return Ok(research_tools(backend, activity));
     }
+    activity
+        .park_hierarchy_waits
+        .store(context.get("delegation").is_some(), Ordering::SeqCst);
     let definitions: Vec<ToolDefinition> = serde_json::from_value(
         context
             .get("tool_catalog")
@@ -419,4 +633,80 @@ pub fn research_tools(
         }) as Box<dyn Tool<ChannelSender>>
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infinity_agent_core::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use infinity_agent_core::system::{AgentSystemBuilder, ModelSource, ResolvedModel};
+
+    struct NoModel;
+
+    #[async_trait(?Send)]
+    impl ModelSource for NoModel {
+        async fn resolve(&self, _thread: &ThreadId<str>) -> Result<ResolvedModel, BoxError> {
+            Err("this callback-delivery fixture must never infer".into())
+        }
+    }
+
+    fn pending(owner: &str) -> PendingWait {
+        PendingWait {
+            work_id: format!("work-{owner}"),
+            group_id: owner.to_owned().into(),
+            id: format!("wait-{owner}").into(),
+            call_id: None,
+            response: json!({"ok": true, "result": {"state": "pending"}}),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_native_queue_marks_join_delivery_fatal_and_clears_every_callback() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let system = AgentSystemBuilder::new_local(
+                    InMemoryConversationStore::new(),
+                    InMemoryStateStore::new(),
+                    NoModel,
+                )
+                .without_builtin_tools()
+                .start();
+                let sender = system.sender();
+                system.shutdown().await;
+
+                let activity = ToolActivity::default();
+                activity
+                    .park_wait(pending("parent-one"))
+                    .expect("first pending join");
+                activity
+                    .park_wait(pending("parent-two"))
+                    .expect("second pending join");
+                let error = activity
+                    .cancel_waits("fixture shutdown", &sender)
+                    .await
+                    .expect_err("all deliveries use the actually closed Infinity input queue");
+                assert!(error.to_string().contains("input channel closed"));
+                assert!(activity.failure().is_some());
+                assert!(!activity.is_parked("parent-one"));
+                assert!(!activity.is_parked("parent-two"));
+                assert_eq!(activity.active(), 0, "parked joins are not executing tools");
+
+                let resume = ToolActivity::default();
+                resume
+                    .park_wait(pending("resuming-parent"))
+                    .expect("resuming join");
+                resume
+                    .resume_wait(
+                        "resuming-parent",
+                        &json!({"claimed": true,
+                "work_id": "work-resuming-parent", "lease_token": "new-host-token"}),
+                        &sender,
+                    )
+                    .await
+                    .expect_err("lost resume callback is fatal too");
+                assert!(resume.failure().is_some());
+                assert!(!resume.is_parked("resuming-parent"));
+            })
+            .await;
+    }
 }

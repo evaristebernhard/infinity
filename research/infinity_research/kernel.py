@@ -22,8 +22,14 @@ from .spec import canonical, digest
 
 TERMINAL_STATES = {"succeeded", "failed", "blocked", "cancelled"}
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}\Z")
-_MUTATIONS = {"create_work", "claim_work", "renew_work", "wait_work",
+_MUTATIONS = {"create_work", "delegate_work", "claim_work", "renew_work", "wait_work",
               "complete_work", "fail_work"}
+_READY_FROM = """ FROM work w LEFT JOIN work_policies policy ON policy.work_id=w.id
+    WHERE w.state='pending' AND NOT EXISTS (
+        SELECT 1 FROM dependencies d JOIN work p ON p.id=d.depends_on
+        WHERE d.work_id=w.id AND CASE COALESCE(policy.join_mode,'all_success')
+            WHEN 'all_settled' THEN p.state NOT IN ('succeeded','failed','blocked','cancelled')
+            ELSE p.state!='succeeded' END)"""
 
 
 def _text(value: Any, name: str, maximum: int = 12000) -> str:
@@ -78,6 +84,21 @@ def validate_contract(spec: dict) -> dict:
             raise ValueError(f"limits.{key} must be finite, positive and at most 366 days")
     if limits["lease_seconds"] > limits["max_wall_seconds"]:
         raise ValueError("lease_seconds cannot exceed max_wall_seconds")
+    if "max_parallel_model_calls" in limits:
+        parallel_calls = limits["max_parallel_model_calls"]
+        if (isinstance(parallel_calls, bool) or not isinstance(parallel_calls, int)
+                or not 1 <= parallel_calls <= limits["max_workers"]):
+            raise ValueError("limits.max_parallel_model_calls must be an integer in 1..max_workers")
+    if "delegation" in normalized:
+        delegation = normalized["delegation"]
+        if not isinstance(delegation, dict) or set(delegation) != {"max_depth", "max_children_per_work"}:
+            raise ValueError("delegation requires max_depth and max_children_per_work")
+        for key, lower, upper in (("max_depth", 0, 2), ("max_children_per_work", 1, 32)):
+            value = delegation[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+                raise ValueError(f"delegation.{key} must be an integer in {lower}..{upper}")
+        if "brief" in normalized:
+            normalized["brief"] = _object(normalized["brief"], "root brief", 32 * 1024)
     return normalized
 
 
@@ -94,6 +115,36 @@ class GenericStore:
             row = db.execute("SELECT task_hash FROM campaign WHERE id=1").fetchone()
         if row is None or row["task_hash"] != digest(self.spec):
             raise ValueError("Task contract changed; create a new campaign")
+        # Additive metadata tables do not rewrite a sealed contract or reinterpret
+        # legacy parent_id provenance. Missing policies retain all-success joins.
+        with self._db(True) as db:
+            self._install_auxiliary_tables(db)
+            if "delegation" in self.spec:
+                root = db.execute("SELECT parent_work_id,depth FROM delegations WHERE work_id='root'").fetchone()
+                missing = db.execute("""SELECT 1 FROM work w LEFT JOIN delegations d ON d.work_id=w.id
+                    WHERE d.work_id IS NULL LIMIT 1""").fetchone()
+                if root is None or root["parent_work_id"] is not None or root["depth"] != 0 or missing:
+                    raise ValueError("Hierarchy metadata is missing; initialize a new campaign rather than converting provenance")
+
+    @staticmethod
+    def _install_auxiliary_tables(db):
+        # execute(), rather than executescript(), keeps this migration inside
+        # the caller's transaction even when multiple RPC processes open it.
+        statements = [
+            """CREATE TABLE IF NOT EXISTS work_policies (
+                work_id TEXT PRIMARY KEY REFERENCES work(id),
+                join_mode TEXT NOT NULL CHECK(join_mode IN ('all_success','all_settled')))""",
+            """CREATE TABLE IF NOT EXISTS delegations (
+                work_id TEXT PRIMARY KEY REFERENCES work(id), parent_work_id TEXT REFERENCES work(id),
+                depth INTEGER NOT NULL CHECK(depth BETWEEN 0 AND 2), brief TEXT NOT NULL,
+                CHECK((parent_work_id IS NULL AND depth=0) OR (parent_work_id IS NOT NULL AND depth>0)))""",
+            "CREATE INDEX IF NOT EXISTS delegation_parent ON delegations(parent_work_id,work_id)",
+            """CREATE TABLE IF NOT EXISTS worker_bindings (
+                owner TEXT PRIMARY KEY, work_id TEXT NOT NULL REFERENCES work(id), created REAL NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS worker_binding_work ON worker_bindings(work_id,owner)",
+        ]
+        for statement in statements:
+            db.execute(statement)
 
     @classmethod
     def create(cls, root: Path, spec: dict) -> "GenericStore":
@@ -156,6 +207,10 @@ class GenericStore:
             db.execute("INSERT INTO campaign(id,task_hash,created) VALUES(1,?,?)", (digest(spec), now))
             db.execute("INSERT INTO work(id,goal,skill_names,state,created,updated) VALUES('root',?,'[]','pending',?,?)",
                        (spec["goal"], now, now))
+            cls._install_auxiliary_tables(db)
+            if "delegation" in spec:
+                db.execute("INSERT INTO delegations(work_id,parent_work_id,depth,brief) VALUES('root',NULL,0,?)",
+                           (canonical(spec.get("brief", {})),))
             db.commit()
             (root / "task.json").write_text(canonical(spec) + "\n")
         finally:
@@ -216,13 +271,26 @@ class GenericStore:
         blocked = 0
         while True:
             updated = db.execute("""UPDATE work SET state='blocked',updated=?,error=?
-                WHERE state='pending' AND EXISTS (
+                WHERE state='pending'
+                AND COALESCE((SELECT join_mode FROM work_policies WHERE work_id=work.id),'all_success')='all_success'
+                AND EXISTS (
                     SELECT 1 FROM dependencies d JOIN work prerequisite ON prerequisite.id=d.depends_on
                     WHERE d.work_id=work.id AND prerequisite.state IN ('failed','blocked','cancelled'))""",
                                  (now, "A required dependency did not succeed"))
             blocked += updated.rowcount
             if not updated.rowcount:
                 break
+        if "delegation" in self.spec:
+            root_state = db.execute("SELECT state FROM work WHERE id='root'").fetchone()[0]
+            active = db.execute("SELECT status FROM campaign WHERE id=1").fetchone()[0] == "active"
+            if active and root_state in ("failed", "blocked"):
+                # A permanently failed root has no remaining coordinator to
+                # integrate new work. Close admission and cancel queued work;
+                # already leased work/effects may still drain. Intermediate
+                # failed branches do not stop their siblings or descendants.
+                # _stop_in_transaction marks status first, so its refresh does
+                # not recurse into another stop transition.
+                self._stop_in_transaction(db, "root_work_" + root_state)
         return {"expired_leases": len(expired), "interrupted_effects": interrupted,
                 "blocked_work": blocked, "replay_policy": "no_automatic_effect_replay"}
 
@@ -233,15 +301,11 @@ class GenericStore:
 
     @staticmethod
     def _ready_rows(db, limit: int = 64):
-        return db.execute("""SELECT w.* FROM work w WHERE w.state='pending' AND NOT EXISTS (
-            SELECT 1 FROM dependencies d JOIN work p ON p.id=d.depends_on
-            WHERE d.work_id=w.id AND p.state!='succeeded') ORDER BY w.created,w.id LIMIT ?""", (limit,)).fetchall()
+        return db.execute("SELECT w.*" + _READY_FROM + " ORDER BY w.created,w.id LIMIT ?", (limit,)).fetchall()
 
     @staticmethod
     def _ready_count(db) -> int:
-        return db.execute("""SELECT COUNT(*) FROM work w WHERE w.state='pending' AND NOT EXISTS (
-            SELECT 1 FROM dependencies d JOIN work p ON p.id=d.depends_on
-            WHERE d.work_id=w.id AND p.state!='succeeded')""").fetchone()[0]
+        return db.execute("SELECT COUNT(*)" + _READY_FROM).fetchone()[0]
 
     def _stop_reason(self, db, *, include_model_limit: bool = True) -> str | None:
         campaign = db.execute("SELECT status,reason FROM campaign WHERE id=1").fetchone()
@@ -252,6 +316,9 @@ class GenericStore:
         counts = self._counts(db)
         effects_running = db.execute("SELECT COUNT(*) FROM effects WHERE state='running'").fetchone()[0]
         if not counts["pending"] and not counts["leased"] and not effects_running:
+            if "delegation" in self.spec:
+                root = db.execute("SELECT state FROM work WHERE id='root'").fetchone()[0]
+                return "work_graph_completed" if root == "succeeded" else "work_graph_exhausted"
             return ("work_graph_completed" if not sum(counts[name] for name in ("failed", "blocked", "cancelled"))
                     else "work_graph_exhausted")
         if (include_model_limit and db.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
@@ -286,10 +353,52 @@ class GenericStore:
             (result IS NOT NULL) AS result_available FROM effects WHERE work_id=?
             ORDER BY created DESC,id DESC LIMIT 8""", (row["id"],)).fetchall()
         result["recent_effects"] = [self._effect_summary(effect) for effect in recent]
+        policy = db.execute("SELECT join_mode FROM work_policies WHERE work_id=?", (row["id"],)).fetchone()
+        result["join_mode"] = policy["join_mode"] if policy else "all_success"
+        result.update(self._delegation_info(db, row["id"]))
         result["result_status"] = "agent_authored_not_independently_verified"
         if owner is None or row["lease_owner"] != owner:
             result.pop("lease_token")
         return result
+
+    def _delegation_info(self, db, work_id: str) -> dict:
+        if "delegation" not in self.spec:
+            return {}
+        row = db.execute("SELECT * FROM delegations WHERE work_id=?", (work_id,)).fetchone()
+        if row is None:
+            raise ValueError("Missing hierarchy metadata for work")
+        children = db.execute("SELECT COUNT(*) FROM delegations WHERE parent_work_id=?", (work_id,)).fetchone()[0]
+        remaining = max(0, self.spec["delegation"]["max_children_per_work"] - children)
+        return {"delegation_parent_id": row["parent_work_id"], "delegation_depth": row["depth"],
+                "brief": json.loads(row["brief"]), "children_count": children,
+                "remaining_child_slots": remaining,
+                "can_delegate": row["depth"] < self.spec["delegation"]["max_depth"] and remaining > 0}
+
+    def _bound_work(self, db, owner: str, work_id: str | None = None) -> str:
+        row = db.execute("SELECT work_id FROM worker_bindings WHERE owner=?", (owner,)).fetchone()
+        if row is None:
+            raise RuntimeError("Hierarchy worker is not bound by the host")
+        if work_id is not None and row["work_id"] != work_id:
+            raise RuntimeError("Hierarchy worker is bound to another work item")
+        return row["work_id"]
+
+    def bind_worker(self, owner: str, work_id: str) -> dict:
+        """Host-only immutable session binding; it grants no lease or new tools."""
+        _text(owner, "owner", 300)
+        _text(work_id, "work_id", 100)
+        if "delegation" not in self.spec:
+            raise ValueError("Worker binding requires a hierarchy campaign")
+        with self._db(True) as db:
+            self._row(db, work_id)
+            self._delegation_info(db, work_id)
+            row = db.execute("SELECT work_id FROM worker_bindings WHERE owner=?", (owner,)).fetchone()
+            if row is not None:
+                if row["work_id"] != work_id:
+                    raise RuntimeError("Hierarchy worker binding is immutable")
+                return {"bound": True, "owner": owner, "work_id": work_id, "duplicate": True}
+            db.execute("INSERT INTO worker_bindings(owner,work_id,created) VALUES(?,?,?)", (owner, work_id, time.time()))
+            self._event(db, "worker_bound", {"owner": owner, "work_id": work_id})
+            return {"bound": True, "owner": owner, "work_id": work_id}
 
     @staticmethod
     def _identity(owner: str, request_key: str):
@@ -313,6 +422,8 @@ class GenericStore:
     def _lease(self, db, work_id: str, owner: str, token: str):
         _text(owner, "owner", 300)
         _text(token, "lease_token", 100)
+        if "delegation" in self.spec:
+            self._bound_work(db, owner, work_id)
         row = self._row(db, work_id)
         if (row["state"] != "leased" or row["lease_owner"] != owner or row["lease_token"] != token
                 or row["lease_expires"] <= time.time()):
@@ -332,10 +443,14 @@ class GenericStore:
             self._row(db, dependency)
             if dependency == work_id:
                 raise ValueError("Work cannot depend on itself")
-            if work_id and db.execute("""WITH RECURSIVE ancestors(id) AS (
-                SELECT ? UNION SELECT d.depends_on FROM dependencies d JOIN ancestors a ON d.work_id=a.id
-                ) SELECT 1 FROM ancestors WHERE id=?""", (dependency, work_id)).fetchone():
-                raise ValueError("Dependency would create a cycle")
+            if work_id:
+                edges = "SELECT work_id source,depends_on target FROM dependencies"
+                if "delegation" in self.spec:
+                    edges += " UNION SELECT parent_work_id,work_id FROM delegations WHERE parent_work_id IS NOT NULL"
+                if db.execute("WITH RECURSIVE edges(source,target) AS (" + edges + """), ancestors(id) AS (
+                    SELECT ? UNION SELECT e.target FROM edges e JOIN ancestors a ON e.source=a.id
+                    ) SELECT 1 FROM ancestors WHERE id=?""", (dependency, work_id)).fetchone():
+                    raise ValueError("Dependency would create a cycle, including required descendant joins")
         return ids
 
     def dispatch_work(self, operation: str, args: dict, *, owner: str, request_key: str) -> dict:
@@ -350,6 +465,10 @@ class GenericStore:
         fingerprint = digest({"operation": operation, "owner": owner, "arguments": args})
         with self._db(True) as db:
             self._refresh(db)
+            if "delegation" in self.spec:
+                if operation == "create_work":
+                    raise RuntimeError("create_work is disabled in hierarchy campaigns; use delegate_work")
+                self._bound_work(db, owner, args.get("work_id"))
             previous = self._replay(db, request_key, fingerprint)
             if previous is not None:
                 return previous
@@ -357,6 +476,8 @@ class GenericStore:
                 raise ValueError("Request key already belongs to a host tool effect")
             if operation == "create_work":
                 result = self._create_work(db, args)
+            elif operation == "delegate_work":
+                result = self._delegate_work(db, args, owner)
             elif operation == "claim_work":
                 result = self._claim_work(db, args, owner)
             else:
@@ -375,6 +496,8 @@ class GenericStore:
             return self._save(db, request_key, fingerprint, result)
 
     def _create_work(self, db, args: dict) -> dict:
+        if "delegation" in self.spec:
+            raise RuntimeError("create_work is disabled in hierarchy campaigns; use delegate_work")
         self._admission(db)
         goal = _text(args.get("goal"), "goal", 32000)
         skills = _names(args.get("skill_names", []), "skill_names")
@@ -392,9 +515,43 @@ class GenericStore:
         self._event(db, "work_created", {"work_id": work_id, "parent_id": parent})
         return {"work_id": work_id, "work": self._work(db, self._row(db, work_id))}
 
+    def _delegate_work(self, db, args: dict, owner: str) -> dict:
+        if "delegation" not in self.spec:
+            raise ValueError("delegate_work requires a hierarchy campaign")
+        if set(args) - {"work_id", "lease_token", "goal", "skill_names", "depends_on", "brief"}:
+            raise ValueError("Unexpected delegation arguments; parent and depth are host-derived")
+        self._admission(db)
+        parent = self._lease(db, args.get("work_id"), owner, args.get("lease_token"))
+        hierarchy = self._delegation_info(db, parent["id"])
+        if hierarchy["delegation_depth"] >= self.spec["delegation"]["max_depth"]:
+            raise RuntimeError("Maximum delegation depth reached")
+        if hierarchy["remaining_child_slots"] == 0:
+            raise RuntimeError("Lifetime child limit reached for this work item")
+        if db.execute("SELECT COUNT(*) FROM work").fetchone()[0] >= self.spec["limits"]["max_work_items"]:
+            raise RuntimeError("Work item limit reached; finish existing work")
+        goal = _text(args.get("goal"), "goal", 32000)
+        skills = _names(args.get("skill_names", []), "skill_names")
+        brief = _object(args.get("brief", {}), "delegation brief", 32 * 1024)
+        # The new child has an implicit parent->child join edge. Reject a child
+        # dependency that can return to its parent through any explicit or
+        # implicit join edge, before admitting a permanently deadlocked branch.
+        dependencies = self._dependencies(db, parent["id"], args.get("depends_on", []))
+        work_id, now = "w_" + uuid.uuid4().hex, time.time()
+        db.execute("""INSERT INTO work(id,goal,parent_id,skill_names,state,created,updated)
+            VALUES(?,?,?,?,'pending',?,?)""", (work_id, goal, parent["id"], canonical(skills), now, now))
+        db.execute("INSERT INTO delegations(work_id,parent_work_id,depth,brief) VALUES(?,?,?,?)",
+                   (work_id, parent["id"], hierarchy["delegation_depth"] + 1, canonical(brief)))
+        db.executemany("INSERT INTO dependencies VALUES(?,?)", [(work_id, dependency) for dependency in dependencies])
+        self._refresh(db)
+        self._event(db, "work_delegated", {"work_id": work_id, "parent_work_id": parent["id"],
+                                            "depth": hierarchy["delegation_depth"] + 1})
+        return {"work_id": work_id, "work": self._work(db, self._row(db, work_id))}
+
     def _claim_work(self, db, args: dict, owner: str) -> dict:
         self._admission(db)
         requested = args.get("work_id")
+        if "delegation" in self.spec:
+            requested = self._bound_work(db, owner, requested)
         owned = db.execute("SELECT * FROM work WHERE state='leased' AND lease_owner=?", (owner,)).fetchone()
         if owned:
             if requested is not None and requested != owned["id"]:
@@ -402,11 +559,8 @@ class GenericStore:
             row = owned
         else:
             if requested is not None:
-                candidate = self._row(db, requested)
-                ready = (candidate["state"] == "pending" and not db.execute("""SELECT 1 FROM dependencies d
-                    JOIN work p ON p.id=d.depends_on WHERE d.work_id=? AND p.state!='succeeded' LIMIT 1""",
-                                                                            (requested,)).fetchone())
-                row = candidate if ready else None
+                self._row(db, requested)
+                row = db.execute("SELECT w.*" + _READY_FROM + " AND w.id=?", (requested,)).fetchone()
             else:
                 ready_rows = self._ready_rows(db, 1)
                 row = ready_rows[0] if ready_rows else None
@@ -426,16 +580,33 @@ class GenericStore:
 
     def _wait_work(self, db, row, args: dict):
         self._no_running_effects(db, row["id"])
+        join_mode = args.get("join_mode", "all_success")
+        if join_mode not in ("all_success", "all_settled"):
+            raise ValueError("join_mode must be all_success or all_settled")
+        if "delegation" in self.spec:
+            # A fresh batch replaces the previous wait, whose failed outcomes
+            # remain discoverable through children and immutable evidence.
+            db.execute("DELETE FROM dependencies WHERE work_id=?", (row["id"],))
         dependencies = self._dependencies(db, row["id"], args.get("depends_on"))
         if not dependencies:
             raise ValueError("wait_work needs at least one dependency")
         db.executemany("INSERT OR IGNORE INTO dependencies VALUES(?,?)", [(row["id"], dep) for dep in dependencies])
+        db.execute("""INSERT INTO work_policies(work_id,join_mode) VALUES(?,?)
+            ON CONFLICT(work_id) DO UPDATE SET join_mode=excluded.join_mode""", (row["id"], join_mode))
         db.execute("""UPDATE work SET state='pending',updated=?,lease_owner=NULL,lease_token=NULL,
             lease_expires=NULL WHERE id=?""", (time.time(), row["id"]))
-        self._event(db, "work_waiting", {"work_id": row["id"], "depends_on": dependencies})
+        self._event(db, "work_waiting", {"work_id": row["id"], "depends_on": dependencies, "join_mode": join_mode})
 
     def _complete_work(self, db, row, args: dict):
         self._no_running_effects(db, row["id"])
+        if "delegation" in self.spec:
+            unfinished = db.execute("""WITH RECURSIVE descendants(id) AS (
+                SELECT work_id FROM delegations WHERE parent_work_id=?
+                UNION SELECT d.work_id FROM delegations d JOIN descendants parent ON d.parent_work_id=parent.id)
+                SELECT w.id FROM work w JOIN descendants d ON d.id=w.id
+                WHERE w.state NOT IN ('succeeded','failed','blocked','cancelled') LIMIT 1""", (row["id"],)).fetchone()
+            if unfinished:
+                raise RuntimeError("Cannot complete work while delegated descendants are unfinished")
         result = _object(args.get("result"), "result")
         effects = _names(args.get("effect_ids", []), "effect_ids", 128)
         for effect_id in effects:
@@ -501,6 +672,8 @@ class GenericStore:
                               "capability": capability, "arguments": arguments})
         with self._db(True) as db:
             self._refresh(db)
+            if "delegation" in self.spec:
+                self._bound_work(db, owner, work_id)
             previous = db.execute("SELECT * FROM effects WHERE request_key=?", (request_key,)).fetchone()
             if previous:
                 if previous["fingerprint"] != fingerprint:
@@ -554,6 +727,8 @@ class GenericStore:
         encoded = canonical(result) if result is not None else None
         with self._db(True) as db:
             self._refresh(db)
+            if "delegation" in self.spec:
+                self._bound_work(db, owner, work_id)
             row = db.execute("SELECT * FROM effects WHERE id=?", (effect_id,)).fetchone()
             if row is None:
                 raise ValueError("Unknown effect")
@@ -695,6 +870,9 @@ class GenericStore:
             raise ValueError("Heartbeat owners must be distinct")
         with self._db(True) as db:
             recovery = self._refresh(db)
+            if "delegation" in self.spec:
+                for owner in owners:
+                    self._bound_work(db, owner)
             now = time.time()
             expiry = min(self._deadline(db), now + self.spec["limits"]["lease_seconds"])
             renewed = 0
@@ -734,7 +912,8 @@ class GenericStore:
                 lease_expires AS expiry FROM work WHERE state='leased' ORDER BY created,id LIMIT 1000""")]
             ready = [{"work_id": row["id"], "goal": row["goal"][:1024],
                       "goal_truncated": len(row["goal"]) > 1024,
-                      "skill_names": json.loads(row["skill_names"])}
+                      "skill_names": json.loads(row["skill_names"]),
+                      **self._delegation_info(db, row["id"])}
                      for row in self._ready_rows(db)]
             recent = [self._work(db, row) for row in db.execute("SELECT * FROM work ORDER BY updated DESC,id LIMIT 32")]
             # The shared snapshot contains bounded summaries; read_work retrieves exact results.
@@ -745,7 +924,7 @@ class GenericStore:
                 item["goal_truncated"] = len(item["goal"]) > 1024
                 item["goal"] = item["goal"][:1024]
             running_effects = db.execute("SELECT COUNT(*) FROM effects WHERE state='running'").fetchone()[0]
-            return {
+            result = {
                 "schema_version": 2, "run_kind": "generic", "task_sha256": digest(self.spec),
                 "task": {"task_id": self.spec["task_id"], "goal": self.spec["goal"]},
                 "root_work_id": "root", "capabilities": self.spec["capabilities"],
@@ -762,6 +941,11 @@ class GenericStore:
                            "observed_input_tokens": calls["i"], "observed_output_tokens": calls["o"],
                            "calls_without_usage": calls["unknown"]},
             }
+            if "delegation" in self.spec:
+                result["delegation"] = dict(self.spec["delegation"])
+            if "max_parallel_model_calls" in self.spec["limits"]:
+                result["max_parallel_model_calls"] = self.spec["limits"]["max_parallel_model_calls"]
+            return result
 
     def report(self) -> dict:
         result = self.context()

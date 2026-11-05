@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "task_id": "hierarchical-small-square-research",
+  "goal": "Study exact unit-square packings for n=4 and n=5. Use two initial research routes with distinct goals, then use a third direct child for independent evidence review if useful. Children may delegate at most one further level. Wait for exploratory routes with all_settled, inspect failures, and return a final report with actual checker effect IDs. Every feasibility claim needs the exact checker. Distinguish an upper bound, an area-bound closure, and unresolved optimality. Do not create synthetic evidence IDs or infer proof from agent agreement.",
+  "brief": {
+    "input": {"instances": [4, 5], "coefficient_field": "Q(sqrt(2))"},
+    "initial_routes": ["Exact constructions, starting with grids and a rotated center", "Independent checking of assumptions and the scope of optimality claims"],
+    "deliverable": "A per-instance report with construction, verification effect IDs, lower-bound status and unresolved questions",
+    "scope": "Small exact examples; not a full Kaggle adapter or decimal submission"
+  },
+  "delegation": {"max_depth": 2, "max_children_per_work": 3},
+  "capabilities": ["verify_square_packing"],
+  "capability_config": {"verify_square_packing": {"max_n": 64, "max_rational_chars": 64}},
+  "skills": ["hierarchical-delegation", "research-decomposition", "geometric-packing", "counterexample-search", "evidence-review", "reproduce-result"],
+  "limits": {
+    "max_workers": 4,
+    "max_parallel_model_calls": 2,
+    "max_parallel_tools": 1,
+    "max_work_items": 13,
+    "max_model_calls": 10000,
+    "max_output_tokens": 16384,
+    "max_wall_seconds": 86400,
+    "max_failures": 4,
+    "lease_seconds": 300
+  }
+}

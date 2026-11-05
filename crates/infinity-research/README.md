@@ -108,8 +108,23 @@ provider's behavior after the request leaves the process.
 The launcher builds `AgentSystemBuilder::new_local` and calls
 `without_builtin_tools()`. For schema 2, it registers the backend's bounded tool
 catalog, injects native owner/request identity around `invoke_tool`, and wakes
-idle workers only for ready work or their own active leases. Workers dynamically
-create and wait for child work inside a bounded native thread pool. A new domain
+idle workers only for ready work or their own active leases. Flat campaigns
+dynamically create and wait for work inside a bounded native thread pool.
+Opt-in hierarchical campaigns use one conversation per logical work item, with
+a shared execution-slot limit and at most two delegation levels. The host binds
+each thread to its work; agents cannot claim an ancestor's goal. A successful
+`wait_work` parks the conversation and releases its lease without polling the
+model. The host reclaims that same work and returns `resume_claim` when its
+dependencies settle. `all_settled` permits failed research branches; the default
+`all_success` still requires every dependency to succeed.
+
+`limits.max_parallel_model_calls` can reduce the single shared provider semaphore
+below `--workers`; no subtree gets an independent quota. Logical threads may
+remain parked while other work uses those slots. See the
+[hierarchical examples](../../research/examples/hierarchical-research/README.md)
+and [design](../../research/docs/hierarchical-agents.md).
+
+A new domain
 capability does not require another Rust tool enum variant. Work completion is
 not a proof verdict, and generic campaigns never invoke the holdout finalizer.
 See the [generic examples](../../research/examples/generic-research/README.md).

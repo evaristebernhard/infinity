@@ -27,13 +27,14 @@ class SkillRegistryTests(unittest.TestCase):
     def test_builtins_have_distinct_triggers_and_resources_load_on_demand(self):
         registry = SkillRegistry.builtin()
         catalog = registry.catalog()
-        self.assertEqual(len(catalog), 12)
-        self.assertEqual(len({row["description"] for row in catalog}), 12)
+        self.assertEqual(len(catalog), 16)
+        self.assertEqual(len({row["description"] for row in catalog}), 16)
         self.assertTrue(all("content" not in row and "resources" not in row for row in catalog))
         expected = {"research-decomposition", "source-research", "experiment-design",
                     "evidence-review", "solver-improvement", "counterexample-search",
                     "formal-proof", "geometric-packing", "kaggle-validation", "code-debugging",
-                    "reproduce-result", "strategy-evolution"}
+                    "reproduce-result", "strategy-evolution", "hierarchical-delegation",
+                    "patent-research", "technical-disclosure", "claim-support-review"}
         self.assertEqual({row["name"] for row in catalog}, expected)
         for name in expected:
             result = registry.load(name)

@@ -4,7 +4,11 @@
 
 ## 通用任务入口
 
-新增的 **schema 2** 不要求数据集、标量分数或留出集。它提供持久任务图、原生 worker 按需唤醒、动态工具目录和 12 个按需加载的内置 skill。目前接入通用 Python 执行与精确正方形构造检查。详细说明见 [通用架构](docs/general-agent-architecture.md)，运行示例见 [generic-research](examples/generic-research/README.md)。
+新增的 **schema 2** 不要求数据集、标量分数或留出集。它提供持久任务图、原生 worker 按需唤醒、动态工具目录和 16 个按需加载的内置 skill。目前接入通用 Python 执行与精确正方形构造检查。详细说明见 [通用架构](docs/general-agent-architecture.md)，运行示例见 [generic-research](examples/generic-research/README.md)。
+
+需要“主 agent → 子 agent → 孙 agent”时，使用 opt-in `delegation` 配置。宿主限制最多两次向下委派，每个逻辑 agent 有独立对话，等待孩子时释放执行和推理槽；`all_settled` 允许主 agent 汇合失败路线。完整配置见 [分层示例](examples/hierarchical-research/README.md)，实现边界见 [组织设计](docs/hierarchical-agents.md)。小算力示例最多 13 个逻辑 agent，共用 2 个模型调用槽和 1 个工具槽。
+
+数学、比赛方面的其他开源实现及具体借鉴点见 [GitHub 调研](docs/autonomous-agent-survey.md)。新增的专利研究、技术交底和支持复核 skills 可复用相同流程；它们不自带检索数据库或对外提交工具。
 
 ```bash
 python3 -m pip install -e ./research
