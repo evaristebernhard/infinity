@@ -62,6 +62,8 @@ def main():
     init.add_argument("--campaign", required=True, type=Path)
     init.add_argument("--data", type=Path)
     init.add_argument("--allow-local", action="store_true", help="Explicitly allow unsandboxed trusted fixture execution")
+    init.add_argument("--skills-root", action="append", type=Path, default=[],
+                      help="Reviewed local skill root to snapshot for a schema-2 campaign; repeatable")
     for name in ("status", "recover", "stop", "finalize", "report"):
         command = commands.add_parser(name)
         command.add_argument("--campaign", required=True, type=Path)
@@ -85,15 +87,45 @@ def main():
                                      validation_fraction=args.validation_fraction,
                                      holdout_fraction=args.holdout_fraction, test_images=args.test_images)
         elif args.command == "init":
-            spec = load_task(args.task, data_override=args.data, allow_local=args.allow_local)
-            store = ResearchStore.create(args.campaign, spec)
-            result = {"campaign": str(store.root), "task_id": spec["task_id"], "ready": True}
+            version = json.loads(args.task.read_text()).get("schema_version")
+            if version == 2:
+                if args.data is not None:
+                    raise ValueError("Generic campaigns receive inputs through capabilities, not --data")
+                from .generic_api import initialize
+                store = initialize(args.task, args.campaign, skill_roots=args.skills_root,
+                                   allow_local=args.allow_local)
+            else:
+                if args.skills_root:
+                    raise ValueError("--skills-root requires a schema-2 generic campaign")
+                spec = load_task(args.task, data_override=args.data, allow_local=args.allow_local)
+                store = ResearchStore.create(args.campaign, spec)
+            result = {"campaign": str(store.root), "task_id": store.spec["task_id"], "ready": True}
         elif args.command == "smoke":
             result = smoke(args.output.resolve())
         elif args.command == "export-filament-submission":
             from .domains.filament import export_submission
             result = export_submission(args.data, args.predictions_dir, args.output)
         else:
+            from .generic_api import campaign_version
+            if campaign_version(args.campaign) == 2:
+                from .generic_api import context
+                from .kernel import GenericStore
+                store = GenericStore(args.campaign)
+                if args.command == "status":
+                    result = context(store)
+                elif args.command == "recover":
+                    result = store.recover()
+                elif args.command == "stop":
+                    store.stop()
+                    result = {"stopped": True, "note": "New work stops; admitted tools drain"}
+                elif args.command == "report":
+                    result = store.report()
+                    if args.output:
+                        args.output.write_text(json.dumps(result, indent=2) + "\n")
+                else:
+                    raise ValueError("Generic campaigns use capability evidence and work results; this command is for schema-1 competitions")
+                print(json.dumps(result, indent=2, allow_nan=False))
+                return 0
             store = ResearchStore(args.campaign)
             if args.command == "status":
                 result = store.context()

@@ -18,9 +18,15 @@ def main():
         if len(raw) > 1024 * 1024:
             raise ValueError("Research request exceeds 1 MiB")
         body = json.loads(raw or b"{}")
-        from .core import dispatch
-        from .store import ResearchStore
-        result = dispatch(ResearchStore(args.campaign), args.operation, body)
+        from .generic_api import campaign_version
+        if campaign_version(args.campaign) == 2:
+            from .generic_api import dispatch
+            from .kernel import GenericStore
+            result = dispatch(GenericStore(args.campaign), args.operation, body)
+        else:
+            from .core import dispatch
+            from .store import ResearchStore
+            result = dispatch(ResearchStore(args.campaign), args.operation, body)
         response = {"ok": True, "result": result}
     except Exception as error:
         response = {"ok": False, "error": f"{type(error).__name__}: {error}"}

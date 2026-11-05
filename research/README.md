@@ -1,10 +1,25 @@
 # Infinity 自主研究
 
-这部分把 Infinity 的原生并发 agent 接到一个持久的研究循环上：读取任务和已有证据，提出实验，执行候选程序，由独立评测器计算结果，然后继续尝试。第一份真实比赛适配是 [Solar Filament Segmentation Challenge 2026](https://www.kaggle.com/competitions/filament-segmentation-2026)。
+这部分把 Infinity 的原生并发 agent 接到持久的工作、工具和证据系统上。通用内核负责目标拆分、并行执行、等待子任务、恢复与汇合；具体研究方法由 skill 提供，运行和检查由工具提供。
 
-数学任务的下一版设计见 [数学研究架构](docs/mathematical-research.md)：以 Squares in Squares 为例，分别维护构造、搜索方法、命题依赖与上下界。随附可单独执行的精确构造示例；数学任务和 Lean 尚未接入当前运行器。
+## 通用任务入口
 
-## 运行结构
+新增的 **schema 2** 不要求数据集、标量分数或留出集。它提供持久任务图、原生 worker 按需唤醒、动态工具目录和 12 个按需加载的内置 skill。目前接入通用 Python 执行与精确正方形构造检查。详细说明见 [通用架构](docs/general-agent-architecture.md)，运行示例见 [generic-research](examples/generic-research/README.md)。
+
+```bash
+python3 -m pip install -e ./research
+python3 -m infinity_research.cli init \
+  --task research/examples/generic-research/task.json \
+  --campaign research/runs/generic-001
+```
+
+随后仍用同一个 Rust `infinity-research` launcher；模型参数与下文相同。精确检查示例不执行生成代码，因此不需要 Docker；通用生成代码执行使用预先构建的 Docker 镜像。
+
+原有 **schema 1** 保留完整比赛实验链，第一份适配是 [Solar Filament Segmentation Challenge 2026](https://www.kaggle.com/competitions/filament-segmentation-2026)。下文的训练、留出集和四个固定工具专门描述这一兼容模式。
+
+数学领域的进一步设计见 [数学研究架构](docs/mathematical-research.md)：构造、搜索方法、命题依赖与上下界需要分别维护。通用任务图和精确构造工具现已接入；完整证明图、Lean、全规模 Kaggle packing 适配仍未实现。
+
+## 比赛兼容模式的运行结构
 
 - **Rust `infinity-research`** 使用 `AgentSystemBuilder`、原生 thread 和异步 tool result。worker 等待训练时让出执行；模型并发和实验并发分别限制。
 - **Python backend** 使用 SQLite WAL 保存任务版本、候选谱系、工作队列、预算、结果和方法记录。多进程领取实验槽位是事务操作。

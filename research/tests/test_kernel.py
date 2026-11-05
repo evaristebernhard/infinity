@@ -1,0 +1,398 @@
+"""Real SQLite concurrency/recovery tests for the domain-neutral research kernel."""
+
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+from infinity_research.kernel import GenericStore, validate_contract
+
+
+def contract(**limits):
+    return {"schema_version": 2, "task_id": "generic-fixture",
+            "goal": "Explore alternative constructions and report only checked evidence",
+            "capabilities": ["exact_check", "artifact_store"],
+            "limits": {"max_workers": 8, "max_model_calls": 100,
+                       "max_output_tokens": 2048, "max_wall_seconds": 3600,
+                       "max_work_items": 100, "max_failures": 3,
+                       "lease_seconds": 60, **limits}}
+
+
+class KernelTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "campaign"
+        self.store = GenericStore.create(self.root, contract())
+        self.next_key = 0
+
+    def op(self, operation, args=None, owner="worker-1", key=None):
+        self.next_key += 1
+        return self.store.dispatch_work(operation, args or {}, owner=owner,
+                                        request_key=key or f"{owner}:{self.next_key}")
+
+    def claim(self, work_id=None, owner="worker-1"):
+        return self.op("claim_work", {"work_id": work_id} if work_id else {}, owner)
+
+    def lease_args(self, claim):
+        return {"work_id": claim["work_id"], "lease_token": claim["lease_token"]}
+
+    def complete(self, claim, owner="worker-1", **result):
+        return self.op("complete_work", {**self.lease_args(claim), "result": result}, owner)
+
+    def expire(self, seconds=61):
+        # Advancing the ledger clock avoids timing-sensitive sleeps in recovery tests.
+        return patch("infinity_research.kernel.time.time", return_value=time.time() + seconds)
+
+    def test_schema_is_generic_and_contract_is_sealed(self):
+        context = self.store.context()
+        self.assertEqual(context["run_kind"], "generic")
+        self.assertEqual(context["ready_work_count"], 1)
+        self.assertEqual(context["budget"]["max_parallel_tools"], 4)
+        self.assertNotIn("data", self.store.spec)
+        self.assertNotIn("objective", self.store.spec)
+        changed = json.loads((self.root / "task.json").read_text())
+        changed["goal"] = "A more convenient objective"
+        (self.root / "task.json").write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, "contract changed"):
+            GenericStore(self.root)
+        with self.assertRaisesRegex(ValueError, "schema_version 2"):
+            validate_contract({**contract(), "schema_version": 1})
+        for bad in (True, 0, -1, float("inf"), "100"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_contract(contract(max_workers=bad))
+
+    def test_initialization_accepts_only_a_prepared_skill_directory(self):
+        other = Path(self.tmp.name) / "with-skills"
+        (other / "skills").mkdir(parents=True)
+        (other / "skills" / "manifest.json").write_text("{}")
+        store = GenericStore.create(other, contract())
+        self.assertEqual(store.read_work("root")["state"], "pending")
+        with self.assertRaisesRegex(ValueError, "new or empty"):
+            GenericStore.create(other, contract())
+        bad = Path(self.tmp.name) / "with-unrelated-files"
+        bad.mkdir()
+        (bad / "other.txt").write_text("preserve me")
+        with self.assertRaisesRegex(ValueError, "new or empty"):
+            GenericStore.create(bad, contract())
+        self.assertEqual((bad / "other.txt").read_text(), "preserve me")
+
+    def test_concurrent_claims_admit_exactly_one_owner_for_one_item(self):
+        def claim(index):
+            fresh = GenericStore(self.root)
+            return fresh.dispatch_work("claim_work", {}, owner=f"worker-{index}", request_key=f"claim-{index}")
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            results = list(pool.map(claim, range(100)))
+        claimed = [item for item in results if item["claimed"]]
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(self.store.context()["work_counts"]["leased"], 1)
+        lease = claimed[0]
+        public = self.store.read_work("root")
+        self.assertNotIn("lease_token", public)
+        self.assertNotIn(lease["lease_token"], json.dumps(self.store.context()))
+
+    def test_request_identity_binds_owner_operation_and_content(self):
+        args = {"goal": "Investigate branch A", "parent_id": "root"}
+        first = self.op("create_work", args, key="create-id")
+        replay = self.op("create_work", args, key="create-id")
+        self.assertEqual(first["work_id"], replay["work_id"])
+        self.assertTrue(replay["duplicate"])
+        for changed, owner in (({**args, "goal": "Different"}, "worker-1"), (args, "worker-2")):
+            with self.assertRaisesRegex(ValueError, "different operation, owner or content"):
+                self.op("create_work", changed, owner, key="create-id")
+        with self.assertRaisesRegex(ValueError, "different operation, owner or content"):
+            self.op("claim_work", {}, key="create-id")
+        self.assertEqual(len(self.store.list_work()["items"]), 2)
+
+    def test_decomposition_waits_without_failure_then_parent_resumes(self):
+        root = self.claim()
+        children = [self.op("create_work", {"goal": f"Alternative {index}", "parent_id": "root"})["work_id"]
+                    for index in range(2)]
+        waiting = self.op("wait_work", {**self.lease_args(root), "depends_on": children})
+        self.assertEqual(waiting["state"], "pending")
+        self.assertEqual(waiting["failure_count"], 0)
+        self.assertEqual(self.store.context()["ready_work_count"], 2)
+        self.assertFalse(self.store.context()["stop"])
+        self.assertFalse(self.claim("root")["claimed"])
+        for index, child in enumerate(children):
+            lease = self.claim(child, owner=f"child-{index}")
+            self.complete(lease, owner=f"child-{index}", note="child outcome")
+        resumed = self.claim("root")
+        self.assertNotEqual(root["lease_token"], resumed["lease_token"])
+        self.assertEqual(resumed["work"]["attempt_count"], 2)
+        self.assertEqual(resumed["work"]["failure_count"], 0)
+        with self.assertRaisesRegex(RuntimeError, "lease lost"):
+            self.complete(root, note="late parent result")
+        final = self.complete(resumed, conclusion="Compare both branches", verified=True)
+        self.assertEqual(final["result_status"], "agent_authored_not_independently_verified")
+        self.assertEqual(self.store.context()["stop_reason"], "work_graph_completed")
+        self.assertEqual(self.store.context()["objective_status"], "not_inferred_from_work_completion")
+
+    def test_dependency_cycle_is_rejected_and_failed_dependencies_block_transitively(self):
+        root = self.claim()
+        child = self.op("create_work", {"goal": "Wait for root", "depends_on": ["root"]})["work_id"]
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            self.op("wait_work", {**self.lease_args(root), "depends_on": [child]})
+        with self.assertRaisesRegex(ValueError, "itself"):
+            self.op("wait_work", {**self.lease_args(root), "depends_on": ["root"]})
+        self.assertEqual(self.store.read_work("root")["state"], "leased")
+        tail = self.op("create_work", {"goal": "After child", "depends_on": [child]})["work_id"]
+        self.op("fail_work", {**self.lease_args(root), "error": "No route found", "retry": False})
+        self.assertEqual(self.store.read_work(child)["state"], "blocked")
+        self.assertEqual(self.store.read_work(tail)["state"], "blocked")
+        self.assertEqual(self.store.context()["stop_reason"], "work_graph_exhausted")
+        self.assertEqual(self.store.context()["objective_status"], "not_inferred_from_work_completion")
+
+    def test_lost_lease_requeues_then_fences_a_late_completion(self):
+        old = self.claim()
+        self.assertEqual(self.store.recover()["expired_leases"], 0)
+        with self.expire():
+            fresh = GenericStore(self.root)
+            recovered = fresh.recover()
+            self.assertEqual(recovered["expired_leases"], 1)
+            new = fresh.dispatch_work("claim_work", {"work_id": "root"}, owner="replacement", request_key="replacement-claim")
+            self.assertNotEqual(old["lease_token"], new["lease_token"])
+            self.assertEqual(new["work"]["failure_count"], 1)
+            with self.assertRaisesRegex(RuntimeError, "lease lost"):
+                self.complete(old, note="late stale answer")
+            fresh.dispatch_work("complete_work", {**self.lease_args(new), "result": {"note": "recovered"}},
+                                owner="replacement", request_key="replacement-complete")
+        self.assertEqual(self.store.read_work("root")["result"], {"note": "recovered"})
+
+    def test_expiry_retries_are_bounded_but_waits_do_not_count_as_failures(self):
+        for failure in range(3):
+            lease = self.claim()
+            self.assertEqual(lease["work"]["failure_count"], failure)
+            result = self.op("fail_work", {**self.lease_args(lease), "error": "Attempt failed"})
+            self.assertEqual(result["state"], "pending" if failure < 2 else "failed")
+        self.assertEqual(self.store.context()["stop_reason"], "work_graph_exhausted")
+
+    def test_lease_owner_is_transport_identity_and_renewal_is_fenced(self):
+        lease = self.claim()
+        with self.assertRaisesRegex(RuntimeError, "lease lost"):
+            self.op("renew_work", self.lease_args(lease), owner="impostor")
+        with patch("infinity_research.kernel.time.time", return_value=time.time() + 20):
+            renewed = self.op("renew_work", self.lease_args(lease))
+        self.assertGreater(renewed["lease_expires"], lease["lease_expires"])
+        self.assertEqual(renewed["failure_count"], 0)
+        self.assertFalse(self.claim("root", owner="other")["claimed"])
+
+    def test_host_heartbeat_keeps_long_thinking_alive_without_reviving_absent_owners(self):
+        root = self.claim()
+        child = self.op("create_work", {"goal": "A worker which will disappear"})["work_id"]
+        lost = self.claim(child, owner="lost-worker")
+        before = self.store.report()
+        just_before_expiry = min(root["lease_expires"], lost["lease_expires"]) - 1
+        with patch("infinity_research.kernel.time.time", return_value=just_before_expiry):
+            heartbeat = self.store.renew_live_leases(["worker-1"])
+        self.assertEqual(heartbeat["renewed"], 1)
+        self.assertGreater(heartbeat["lease_expires"], root["lease_expires"])
+        # A successful heartbeat does not inflate the event journal or create
+        # a model/tool receipt; polling may run for days.
+        self.assertEqual(len(self.store.report()["events"]), len(before["events"]))
+        after_old_expiry = max(root["lease_expires"], lost["lease_expires"]) + 1
+        with patch("infinity_research.kernel.time.time", return_value=after_old_expiry):
+            recovery = self.store.recover()
+            self.assertEqual(recovery["expired_leases"], 1)
+            self.assertEqual(self.store.read_work("root")["state"], "leased")
+            self.assertEqual(self.store.read_work(child)["state"], "pending")
+            not_revived = self.store.renew_live_leases(["lost-worker"])
+            self.assertEqual(not_revived["renewed"], 0)
+            self.assertEqual(self.store.read_work(child)["failure_count"], 1)
+            self.complete(root, note="A healthy model finished after the original expiry")
+
+    def test_host_heartbeat_expires_before_renewal_and_preserves_unknown_effects(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "lost-tool")
+        with patch("infinity_research.kernel.time.time", return_value=lease["lease_expires"] + 1):
+            result = self.store.renew_live_leases(["worker-1"])
+            self.assertEqual(result["renewed"], 0)
+            self.assertEqual(result["expired_leases"], 1)
+            self.assertEqual(result["interrupted_effects"], 1)
+            self.assertEqual(self.store.effect(effect["effect_id"])["state"], "interrupted")
+            self.assertEqual(self.store.read_work("root")["state"], "pending")
+            with self.assertRaisesRegex(RuntimeError, "lease lost"):
+                self.complete(lease, note="Cannot revive a stale result")
+
+    def test_owner_stop_allows_only_existing_live_work_to_renew_until_hard_wall(self):
+        lease = self.claim()
+        child = self.op("create_work", {"goal": "Must never be claimed after stop"})["work_id"]
+        self.store.stop()
+        with patch("infinity_research.kernel.time.time", return_value=lease["lease_expires"] - 1):
+            heartbeat = self.store.renew_live_leases(["worker-1"])
+            self.assertEqual(heartbeat["renewed"], 1)
+            with self.assertRaisesRegex(RuntimeError, "admission closed"):
+                self.claim(child, owner="replacement")
+            self.assertEqual(self.store.read_work(child)["state"], "cancelled")
+        with patch("infinity_research.kernel.time.time", return_value=time.time() + 3601):
+            expired = self.store.renew_live_leases(["worker-1"])
+            self.assertEqual(expired["renewed"], 0)
+            self.assertEqual(self.store.read_work("root")["state"], "cancelled")
+
+    def test_host_heartbeat_validates_owners_and_is_not_an_agent_operation(self):
+        for owners in (None, "worker-1", [""], [" "], [True], ["x" * 301],
+                       ["same", "same"], [f"worker-{index}" for index in range(9)]):
+            with self.subTest(owners=owners), self.assertRaises(ValueError):
+                self.store.renew_live_leases(owners)
+        self.assertEqual(self.store.renew_live_leases([])["renewed"], 0)
+        with self.assertRaisesRegex(ValueError, "Unknown work operation"):
+            self.op("renew_live_leases", {"owners": ["worker-1"]})
+
+    def test_effect_reservation_is_idempotent_and_unknown_outcomes_never_replay(self):
+        lease = self.claim()
+        args = ("worker-1", "root", lease["lease_token"], "exact_check", {"candidate": 7}, "check-key")
+        started = self.store.reserve_effect(*args)
+        self.assertTrue(started["execute"])
+        duplicate = self.store.reserve_effect(*args)
+        self.assertFalse(duplicate["execute"])
+        self.assertEqual(duplicate["state"], "running")
+        with self.assertRaisesRegex(ValueError, "different content or lease"):
+            self.store.reserve_effect(*args[:4], {"candidate": 8}, "check-key")
+        with self.assertRaisesRegex(RuntimeError, "running tools"):
+            self.complete(lease, note="cannot leave while tool runs")
+        with self.expire():
+            recovered = GenericStore(self.root).recover()
+            self.assertEqual(recovered["interrupted_effects"], 1)
+            unknown = self.store.reserve_effect(*args)
+            self.assertFalse(unknown["execute"])
+            self.assertEqual(unknown["state"], "interrupted")
+            self.assertIsNone(unknown["result"])
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                self.store.finish_effect(started["effect_id"], "worker-1", "root", lease["lease_token"],
+                                         result={"judgement": "verified"})
+        self.assertEqual(self.store.effect(started["effect_id"])["state"], "interrupted")
+
+    def test_host_result_is_immutable_but_unknown_judgement_is_not_false(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "host-check")
+        result = {"judgement": "unknown", "method": "bounded_checker", "reason": "precision exhausted"}
+        finished = self.store.finish_effect(effect["effect_id"], "worker-1", "root", lease["lease_token"], result=result)
+        self.assertEqual(finished["state"], "succeeded")  # Tool completed, mathematical verdict remains unknown.
+        self.assertEqual(finished["result"], result)
+        self.assertEqual(finished["result_status"], "host_tool_output")
+        duplicate = self.store.finish_effect(effect["effect_id"], "worker-1", "root", lease["lease_token"], result=result)
+        self.assertTrue(duplicate["duplicate"])
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            self.store.finish_effect(effect["effect_id"], "worker-1", "root", lease["lease_token"],
+                                     result={"judgement": "verified"})
+        final = self.op("complete_work", {**self.lease_args(lease), "result": {"status": "unresolved"},
+                                           "effect_ids": [effect["effect_id"]]})
+        self.assertEqual(final["effect_ids"], [effect["effect_id"]])
+        self.assertEqual(final["result_status"], "agent_authored_not_independently_verified")
+        self.assertNotIn("lease_token", self.store.effect(effect["effect_id"]))
+
+    def test_bounded_large_tool_results_fit_the_capability_envelope(self):
+        lease = self.claim()
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "large")
+        result = {"candidate_output": "x" * (600 * 1024), "judgement": "unverified"}
+        self.store.finish_effect(effect["effect_id"], "worker-1", "root", lease["lease_token"], result=result)
+        self.assertEqual(self.store.effect(effect["effect_id"])["result"], result)
+
+    def test_capability_allowlist_and_effect_slots_are_enforced_atomically(self):
+        root = self.claim()
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            self.store.reserve_effect("worker-1", "root", root["lease_token"], "unregistered", {}, "denied")
+        leases = [("worker-1", root)]
+        for index in range(5):
+            child = self.op("create_work", {"goal": f"Branch {index}"})["work_id"]
+            owner = f"extra-{index}"
+            leases.append((owner, self.claim(child, owner)))
+
+        def reserve(item):
+            owner, lease = item
+            try:
+                return GenericStore(self.root).reserve_effect(owner, lease["work_id"], lease["lease_token"],
+                                                              "exact_check", {}, f"tool-{owner}")
+            except RuntimeError as error:
+                return str(error)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(reserve, leases))
+        accepted = [item for item in results if isinstance(item, dict)]
+        refused = [item for item in results if isinstance(item, str)]
+        self.assertEqual(len(accepted), 4)
+        self.assertEqual(len(refused), 2)
+        self.assertTrue(all("capacity busy" in message for message in refused))
+        self.assertEqual(self.store.context()["active_tools"], 4)
+        self.assertFalse(self.store.context()["stop"])
+
+    def test_effect_and_work_transport_keys_cannot_alias(self):
+        lease = self.claim()
+        self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "same-key")
+        with self.assertRaisesRegex(ValueError, "host tool effect"):
+            self.op("create_work", {"goal": "alias"}, key="same-key")
+        self.op("create_work", {"goal": "bound key"}, key="work-key")
+        with self.assertRaisesRegex(ValueError, "work mutation"):
+            self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "work-key")
+
+    def test_model_admission_survives_restart_and_drains_already_admitted_work(self):
+        other = GenericStore.create(Path(self.tmp.name) / "one-call", contract(max_model_calls=1))
+        lease = other.dispatch_work("claim_work", {}, owner="owner", request_key="claim")
+        admission = other.reserve_model_call("request")
+        self.assertTrue(admission["allowed"])
+        other = GenericStore(other.root)
+        self.assertEqual(other.reserve_model_call("request")["reason"], "request_id_already_reserved")
+        self.assertFalse(other.reserve_model_call("next")["allowed"])
+        effect = other.reserve_effect("owner", "root", lease["lease_token"], "exact_check", {}, "last-tool")
+        self.assertTrue(other.context()["draining"])
+        other.finish_effect(effect["effect_id"], "owner", "root", lease["lease_token"], result={"value": 1})
+        other.dispatch_work("complete_work", {**self.lease_args(lease), "result": {"finished": True}},
+                            owner="owner", request_key="finish")
+        self.assertEqual(other.context()["stop_reason"], "work_graph_completed")
+        other.record_usage("request", 20, 10)
+        self.assertTrue(other.record_usage("request", 20, 10)["duplicate"])
+        with self.assertRaisesRegex(ValueError, "Conflicting usage"):
+            other.record_usage("request", 20, 11)
+
+    def test_stop_cancels_pending_work_but_preserves_inflight_tool_receipt(self):
+        lease = self.claim()
+        child = self.op("create_work", {"goal": "Queued"})["work_id"]
+        effect = self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "before-stop")
+        self.store.stop()
+        self.assertEqual(self.store.read_work(child)["state"], "cancelled")
+        self.assertTrue(self.store.context()["draining"])
+        with self.assertRaisesRegex(RuntimeError, "admission closed"):
+            self.store.reserve_effect("worker-1", "root", lease["lease_token"], "exact_check", {}, "after-stop")
+        self.store.finish_effect(effect["effect_id"], "worker-1", "root", lease["lease_token"], result={"value": 1})
+        self.complete(lease, note="inflight work drained")
+        self.assertEqual(self.store.context()["stop_reason"], "stopped_by_owner")
+        self.assertFalse(self.store.context()["draining"])
+
+    def test_pagination_covers_large_graph_without_exposing_lease_credentials(self):
+        lease = self.claim()
+        ids = {"root"}
+        for index in range(40):
+            ids.add(self.op("create_work", {"goal": f"Branch {index}"})["work_id"])
+        seen, cursor = [], None
+        while True:
+            page = self.store.list_work(after_id=cursor, limit=7)
+            seen.extend(item["id"] for item in page["items"])
+            self.assertNotIn(lease["lease_token"], json.dumps(page))
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(seen, sorted(ids))
+        self.assertEqual([item["id"] for item in self.store.list_work(state="leased")["items"]], ["root"])
+        with self.assertRaises(ValueError):
+            self.store.list_work(limit=True)
+        with self.assertRaises(ValueError):
+            self.store.list_work(state="verified")
+
+    def test_shared_context_summarizes_large_goals_but_read_preserves_them(self):
+        goal = "A detailed research direction. " * 1000
+        child = self.op("create_work", {"goal": goal})["work_id"]
+        context = self.store.context()
+        ready = next(item for item in context["ready_work"] if item["work_id"] == child)
+        recent = next(item for item in context["recent_work"] if item["id"] == child)
+        self.assertTrue(ready["goal_truncated"])
+        self.assertTrue(recent["goal_truncated"])
+        self.assertEqual(len(ready["goal"]), 1024)
+        self.assertEqual(self.store.read_work(child)["goal"], goal)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,14 +8,16 @@ Kaggle result or a long-duration production campaign.
 
 | Check | Result |
 | --- | --- |
-| Python backend, ledger, executor and domain tests | 56 passed, including the optional pycocotools interoperability tests and evaluator resource-limit checks |
-| Native `infinity-research` tests | 14 passed |
+| Python backend, kernel, skills, tools, executor and domain tests | 120 passed, including optional pycocotools interoperability |
+| Native `infinity-research` tests | 15 passed |
 | `cargo clippy -p infinity-research --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --all --check` | Passed |
 | Native launcher `--help` | Passed |
 | Standalone exact square-packing example | Six self-checks passed; exact certificates generated for n=4 and n=5 |
+| Generic offline composition | Three work items completed, three real tool effects, actual Python execution plus independent exact n=4/n=5 checks |
+| Packaged skill resources | Built and extracted a wheel; all 12 skills and three references loaded outside the source checkout |
 | `git diff --check` | Passed |
-| Repository `./check.bash` | Blocked at the prerequisite check because `jj` is unavailable; the complete upstream workspace suite did not run |
+| Repository `./check.bash` | Local entry point stops at missing `jj`; scoped tests above ran separately. GitHub's full CI is the separate merge gate |
 
 Reproduce the scoped checks from the repository root after installing a current
 Rust toolchain and the Python dependencies:
@@ -29,6 +31,35 @@ cargo fmt --all --check
 ```
 
 ## What the tests exercise
+
+### Generic campaigns
+
+The schema-2 native integration launches **100 actual Infinity worker threads**
+with a scripted provider and the real Python RPC backend. It creates two child
+goals from the root, releases the root lease to wait, loads pinned skills, runs
+the exact checker, reads and hashes actual certificate artifacts, then reclaims
+the root and joins both results. Exactly three work items succeed. The parent
+has two attempts and zero failures. The test bounds the complete flow below 60
+model calls rather than waking every idle worker to poll. Restart after completion
+makes zero new model calls, and no schema-1 holdout finalizer is invoked.
+
+Python kernel tests exercise 100 competing claims for one task, atomic tool-slot
+limits, dependency cycles, blocked descendants, immutable receipts, stale leases,
+interrupted effects without replay, pagination, and host heartbeat renewal during
+long model reasoning. Host stop drains admitted tools; neither a heartbeat nor
+a late result can revive a lost attempt.
+
+The composition tests execute a trusted Python program that writes a layout,
+call a different exact verification tool, read the real certificate, and complete
+work using the returned evidence. Execution output remains unverified, exact
+feasibility has its own judgement, and work completion remains agent-authored.
+Modified skill bytes, capability implementations and artifact bytes are rejected.
+
+The generic offline example also runs two child tasks concurrently and joins
+their outcomes. The n=4 grid closes the area lower bound; n=5 is only a feasible
+construction. This checks code paths and claim scope, not autonomous discovery.
+
+### Original competition campaigns
 
 The native concurrency test launches **100 actual Infinity worker threads** with
 a mock model provider, four simulated experiment slots and a global cap of 250

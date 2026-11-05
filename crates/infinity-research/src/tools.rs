@@ -1,5 +1,6 @@
 //! Research operations registered as real asynchronous Infinity tools.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -10,6 +11,7 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use rap_protocol::{ProviderCallId, ToolCallId};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{BoxError, ResearchBackend};
@@ -139,6 +141,149 @@ struct ResearchTool {
     operation: Operation,
     backend: Arc<dyn ResearchBackend>,
     activity: Arc<ToolActivity>,
+}
+
+/// A tool contract supplied by the host backend, never by a worker or a skill.
+#[derive(Clone, Deserialize)]
+struct ToolDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+struct CapabilityTool {
+    definition: ToolDefinition,
+    backend: Arc<dyn ResearchBackend>,
+    activity: Arc<ToolActivity>,
+}
+
+fn start_operation(
+    operation: &'static str,
+    arguments: Value,
+    id: ToolCallId,
+    call_id: Option<ProviderCallId>,
+    context: &ToolContext<ChannelSender>,
+    backend: Arc<dyn ResearchBackend>,
+    activity: Arc<ToolActivity>,
+) {
+    let sender = context.message_sender.clone();
+    let group_id = context.group_id.clone();
+    let guard = ActivityGuard::new(activity);
+    tokio::spawn(async move {
+        let _guard = guard;
+        let response = match backend.call(operation, arguments).await {
+            Ok(result) => json!({"ok": true, "result": result}),
+            Err(error) => {
+                tracing::warn!(%group_id, operation, %error, "research operation failed");
+                json!({"ok": false, "error": error.to_string()})
+            }
+        };
+        let message = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: id.as_str().to_owned(),
+                call_id: call_id.map(ProviderCallId::into_inner),
+                content: vec![ToolResultContent::Text(Text {
+                    text: response.to_string(),
+                })],
+            })),
+            group_id,
+            metadata: None,
+            synthetic: None,
+            display_as: None,
+            subscription: false,
+        };
+        if let Err(error) = sender.send_to_input_queue(message, id.as_str()).await {
+            tracing::error!(%error, tool_call_id = %id, "failed to deliver persisted tool result");
+        }
+    });
+}
+
+#[async_trait]
+impl Tool<ChannelSender> for CapabilityTool {
+    fn name(&self) -> &str {
+        &self.definition.name
+    }
+    fn description(&self) -> &str {
+        &self.definition.description
+    }
+    fn parameters(&self) -> Value {
+        self.definition.parameters.clone()
+    }
+
+    async fn execute(
+        &self,
+        arguments: Value,
+        id: ToolCallId,
+        call_id: Option<ProviderCallId>,
+        context: &ToolContext<ChannelSender>,
+    ) -> Result<(), BoxError> {
+        if !arguments.is_object() {
+            return Err("capability tool arguments must be a JSON object".into());
+        }
+        // Keep transport authority outside the model's arguments. Even a
+        // forged `owner` or `request_key` inside arguments cannot replace it.
+        let envelope = json!({
+            "tool": self.definition.name,
+            "arguments": arguments,
+            "owner": context.group_id,
+            "request_key": format!("{}:{}", context.group_id, id),
+        });
+        start_operation(
+            "invoke_tool",
+            envelope,
+            id,
+            call_id,
+            context,
+            self.backend.clone(),
+            self.activity.clone(),
+        );
+        Ok(())
+    }
+}
+
+/// Use a versioned host catalog for generic campaigns; schema-1 campaigns keep
+/// their existing tools and wire protocol unchanged.
+pub fn campaign_tools(
+    context: &Value,
+    backend: Arc<dyn ResearchBackend>,
+    activity: Arc<ToolActivity>,
+) -> Result<Vec<Box<dyn Tool<ChannelSender>>>, BoxError> {
+    if context.get("run_kind").and_then(Value::as_str) != Some("generic") {
+        return Ok(research_tools(backend, activity));
+    }
+    let definitions: Vec<ToolDefinition> = serde_json::from_value(
+        context
+            .get("tool_catalog")
+            .ok_or("generic campaign has no tool_catalog")?
+            .clone(),
+    )?;
+    if definitions.is_empty() || definitions.len() > 64 {
+        return Err("host tool catalog must contain 1..64 tools".into());
+    }
+    let mut seen = HashSet::new();
+    let mut result: Vec<Box<dyn Tool<ChannelSender>>> = Vec::new();
+    for definition in definitions {
+        if definition.name.is_empty()
+            || definition.name.len() > 64
+            || !definition
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            || !seen.insert(definition.name.clone())
+            || definition.description.is_empty()
+            || definition.description.len() > 4096
+            || definition.parameters.get("type").and_then(Value::as_str) != Some("object")
+            || serde_json::to_vec(&definition.parameters)?.len() > 65_536
+        {
+            return Err("invalid or duplicate host tool definition".into());
+        }
+        result.push(Box::new(CapabilityTool {
+            definition,
+            backend: backend.clone(),
+            activity: activity.clone(),
+        }));
+    }
+    Ok(result)
 }
 
 #[async_trait]

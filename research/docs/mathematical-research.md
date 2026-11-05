@@ -2,10 +2,12 @@
 
 设计日期：2026-11-05。
 
-**状态：这是现有自主研究运行器的下一版设计。** 当前运行器仍只注册了
-`filament` 和 `smoke`，还没有接入 Squares in Squares 或 Lean。本次新增的
-[精确构造示例](../examples/squares-in-squares/README.md)可以单独执行，
-用于检查数学证据的表示；它不是已经上线的数学 agent 系统。
+**状态：完整的构造档案、命题图和证明适配仍是设计。** 后续的
+[通用 schema 2 内核](general-agent-architecture.md)已经接入持久工作图、skill
+加载、Python 执行与小规模精确正方形检查工具。
+[精确构造示例](../examples/squares-in-squares/README.md)与该工具共用 checker。
+这还不包含全规模 Squares in Squares 参赛流程、逐实例最优档案或 Lean；
+下文的数学类型、证明状态和完整场景适配按设计阅读。
 
 ## 1. 统一执行机制，分别定义研究成果
 
