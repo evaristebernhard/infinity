@@ -2,6 +2,8 @@
 
 这部分把 Infinity 的原生并发 agent 接到一个持久的研究循环上：读取任务和已有证据，提出实验，执行候选程序，由独立评测器计算结果，然后继续尝试。第一份真实比赛适配是 [Solar Filament Segmentation Challenge 2026](https://www.kaggle.com/competitions/filament-segmentation-2026)。
 
+数学任务的下一版设计见 [数学研究架构](docs/mathematical-research.md)：以 Squares in Squares 为例，分别维护构造、搜索方法、命题依赖与上下界。随附可单独执行的精确构造示例；数学任务和 Lean 尚未接入当前运行器。
+
 ## 运行结构
 
 - **Rust `infinity-research`** 使用 `AgentSystemBuilder`、原生 thread 和异步 tool result。worker 等待训练时让出执行；模型并发和实验并发分别限制。
@@ -48,6 +50,8 @@ cargo clippy -p infinity-research --all-targets --locked -- -D warnings
 ## Solar Filament：从数据到无人值守运行
 
 需要 Linux/WSL、Python 3.11+、当前 stable Rust 和可用的 Docker。本次使用 Rust 1.99.1 验证；文件锁接口本身要求 Rust 1.89 或以上，完整依赖的最低兼容版本未单独验证。比赛任务默认每个实验使用一张 GPU；Docker GPU 模式还需要宿主的 NVIDIA Container Toolkit。CPU 配置可以把 `executor.gpus` 改为 `0`，并重新设置时间预算。
+
+macOS 只支持可信的离线 `smoke` 示例；该示例明确不施加地址空间上限，并在结果中记录 `memory_enforced: false`。正式领域的初始化会在 macOS 提前拒绝。Linux/WSL 保留地址空间与 CPU 限制，不能把 macOS 示例通过当成正式比赛运行环境已验证。
 
 ### 1. 准备环境和官方比赛数据
 

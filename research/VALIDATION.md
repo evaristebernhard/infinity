@@ -8,11 +8,12 @@ Kaggle result or a long-duration production campaign.
 
 | Check | Result |
 | --- | --- |
-| Python backend, ledger, executor and domain tests | 50 passed, including the optional pycocotools interoperability tests |
+| Python backend, ledger, executor and domain tests | 56 passed, including the optional pycocotools interoperability tests and evaluator resource-limit checks |
 | Native `infinity-research` tests | 14 passed |
 | `cargo clippy -p infinity-research --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --all --check` | Passed |
 | Native launcher `--help` | Passed |
+| Standalone exact square-packing example | Six self-checks passed; exact certificates generated for n=4 and n=5 |
 | `git diff --check` | Passed |
 | Repository `./check.bash` | Blocked at the prerequisite check because `jj` is unavailable; the complete upstream workspace suite did not run |
 
@@ -44,6 +45,16 @@ The provider tests inspect serialized Chat Completions HTTP requests to ensure
 the admitted output-token cap is present. They also exercise the total model
 deadline while a stream remains active and its reduction to the remaining
 search wall time.
+
+The first full upstream CI run passed Ubuntu tests but found a missing generated
+license notice and a macOS Python integration failure. The follow-up adds the
+missing `infinity-research` license entry, richer integration-test diagnostics,
+and an explicit Darwin policy. Only the known trusted `smoke` domain may run
+there without an address-space cap, which is disclosed in evaluation evidence;
+production domains fail during initialization. Linux retains its address-space
+and CPU limits, including a real subprocess test that rejects an oversized
+allocation. A dedicated macOS smoke job checks the deployment-specific behavior.
+Do not infer macOS production support from that fixture job.
 
 Python tests cover atomic admission, resource reservation, semantic candidate
 deduplication, stale-worker fencing, failed trials, orphaned queue recovery,
@@ -86,6 +97,15 @@ steps and inference on six synthetic 64 x 64 images, using 32-pixel training
 crops and a reduced eight-channel model. Checkpoint writing, prediction output
 and independent PQ evaluation completed. This is an executable-path check;
 it does not establish full-resolution model quality.
+
+The separate [square-packing example](examples/squares-in-squares/README.md)
+uses exact arithmetic in Q(sqrt(2)) to check a five-square construction of side
+`2 + sqrt(2)/2` and the four-square 2-by-2 grid. Every pair has a recorded
+separating-axis witness. The five-square result establishes feasibility only;
+the four-square grid also attains the area lower bound. Invalid overlapping,
+out-of-bounds and non-unit examples are rejected. This is not a Lean proof,
+an autonomous search result or a tested Kaggle decimal submission, and the
+mathematical task adapter described in the design document is not registered.
 
 ## Validation still requiring the deployment environment
 
