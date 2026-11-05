@@ -138,6 +138,8 @@ def load_task(path: Path, *, data_override: Path | None = None,
               allow_local: bool = False) -> dict:
     path = path.resolve()
     spec = json.loads(path.read_text())
+    from .evaluate import validate_evaluation_host
+    validate_evaluation_host(spec.get("domain"))
     baseline = spec.pop("baseline", None)
     if baseline is not None:
         spec["baseline_files"] = {"main.py": (path.parent / baseline).read_text()}

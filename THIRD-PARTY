@@ -8857,6 +8857,7 @@ Used by:
   infinity-provider-protocol 0.2.0
   infinity-provider-rig 0.2.0
   infinity-rap-bridge 0.2.0
+  infinity-research 0.1.0
   infinity-slack-bot 0.1.0
   infinity-slack-dataflow 0.1.0
   rap-client 0.2.0

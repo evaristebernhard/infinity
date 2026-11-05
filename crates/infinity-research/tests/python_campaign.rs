@@ -102,7 +102,7 @@ impl ModelProvider for FixtureProvider {
             );
             assert!(
                 history.contains("succeeded"),
-                "recovered experiment must be terminal"
+                "recovered experiment must succeed; persisted context: {history}"
             );
         }
         let called = |name: &str| {
@@ -142,8 +142,11 @@ impl ModelProvider for FixtureProvider {
                     _ => None,
                 })
                 .expect("experiment result must reach the native model conversation");
-            assert_eq!(result["ok"], true);
-            assert_eq!(result["result"]["state"], "succeeded");
+            assert_eq!(result["ok"], true, "backend reply: {result}");
+            assert_eq!(
+                result["result"]["state"], "succeeded",
+                "candidate execution/evaluation evidence: {result}"
+            );
             StreamChunk::ToolCall(ToolCall::new(
                 "record-evidence",
                 "record_finding",
