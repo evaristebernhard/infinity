@@ -21,6 +21,7 @@ members = [
     "crates/infinity-provider-rig",
     "crates/infinity-slack-bot",
     "crates/infinity-slack-dataflow",
+    "crates/infinity-research",
 ]
 resolver = "2"
 
