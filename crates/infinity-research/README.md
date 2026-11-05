@@ -1,8 +1,9 @@
 # infinity-research
 
 Run a bounded group of autonomous research workers on **Infinity's native agent
-runtime**. The first supplied domain is the Kaggle `filament-segmentation-2026`
-competition; the runtime itself does not contain segmentation or Kaggle logic.
+runtime**. Schema-2 campaigns use a generic work graph, a host-supplied tool catalog
+and pinned skills. Schema-1 campaigns retain the Kaggle `filament-segmentation-2026`
+experiment loop. The Rust runtime does not contain domain logic.
 
 Workers propose hypotheses and complete candidate programs, run experiments,
 inspect failures, and share evidence through the persistent Python backend in
@@ -104,12 +105,16 @@ provider's behavior after the request leaves the process.
 
 ## What runs autonomously
 
-The launcher builds `AgentSystemBuilder::new_local` with four research tools and
-calls `without_builtin_tools()`. It creates a fixed number of native Infinity
-threads, each with the latest durable campaign context. Workers cannot create
-arbitrary child workers through a model tool. When a worker becomes idle and
-the campaign still admits research, the supervisor sends updated campaign state
-and asks it to continue.
+The launcher builds `AgentSystemBuilder::new_local` and calls
+`without_builtin_tools()`. For schema 2, it registers the backend's bounded tool
+catalog, injects native owner/request identity around `invoke_tool`, and wakes
+idle workers only for ready work or their own active leases. Workers dynamically
+create and wait for child work inside a bounded native thread pool. A new domain
+capability does not require another Rust tool enum variant. Work completion is
+not a proof verdict, and generic campaigns never invoke the holdout finalizer.
+See the [generic examples](../../research/examples/generic-research/README.md).
+
+Schema 1 keeps its four existing tools and eager experiment continuation:
 
 | Native tool | Backend operation | Purpose |
 | --- | --- | --- |
@@ -135,6 +140,14 @@ stderr. The launcher also uses host-only `recover`, `reserve_model_call`,
 `record_usage`, and `finalize` operations. None are exposed as model tools.
 
 ## Limits, stopping, and restart
+
+Schema 2 uses work-item/lease limits and a separate tool-call concurrency limit.
+The host supervisor renews leases belonging to live native threads, including
+while a model is reasoning. Tool processes also renew their own lease. A lost
+or expired token cannot be revived. Work completion ends the workflow but does
+not assert that the scientific goal is proved. Interrupted effects remain unknown
+and are not automatically replayed. The schema-1 experiment details below retain
+their previous meaning.
 
 The task contract supplies the authoritative maximum workers, model calls,
 experiment count, experiment concurrency, trial time, and campaign wall time.
@@ -216,3 +229,10 @@ drains an orphan queued at budget stop, performs one holdout evaluation, and
 verifies that a restart cannot reset the
 model budget. These are architecture tests on a tiny regression fixture, not a
 real LLM run or a Kaggle performance claim.
+
+A separate generic integration uses 100 native threads and the real Python work
+graph, pinned skills, exact n=4/n=5 checks, artifact reading and dependency joins.
+The model dynamically creates two child work items and waits for them; the root
+is then reclaimed without treating waiting as failure. Fewer than 60 model calls
+are admitted for the entire scripted flow; a completed restart makes no calls.
+Only the model decisions are scripted, not the tools or ledger.

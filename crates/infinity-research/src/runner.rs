@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::tools::{ToolActivity, research_tools};
+use crate::tools::{ToolActivity, campaign_tools};
 use crate::{BoxError, BudgetedProvider, ResearchBackend};
 
 /// Runtime bounds, separate from the campaign's persistent global budgets.
@@ -74,6 +74,9 @@ pub async fn finalize_if_eligible(
         return Ok(None);
     }
     let context = backend.call("context", json!({})).await?;
+    if context.get("run_kind").and_then(Value::as_str) == Some("generic") {
+        return Ok(None);
+    }
     if !context
         .get("stop_reason")
         .and_then(Value::as_str)
@@ -114,6 +117,18 @@ fn stop_reason(context: &Value) -> Result<Option<String>, BoxError> {
 }
 
 fn continuation_prompt(worker: usize, workers: usize, context: &Value) -> String {
+    if context.get("run_kind").and_then(Value::as_str) == Some("generic") {
+        return format!(
+            "You are worker {} of {} available native workers. Claim useful ready work, \
+             or continue your own current lease. Read relevant skills and dependency results. \
+             Decompose when independent work would help; use tools to produce evidence and \
+             persist results. If no work is ready, end this turn and let the supervisor wait. \
+             This persisted state is authoritative after a restart.\n\n{}",
+            worker + 1,
+            workers,
+            context,
+        );
+    }
     format!(
         "You are research worker {} of {}. Use the latest persisted campaign state below. \
          Choose a useful experiment, execute it, record the evidence, and continue. \
@@ -123,6 +138,46 @@ fn continuation_prompt(worker: usize, workers: usize, context: &Value) -> String
         workers,
         context,
     )
+}
+
+/// Generic campaigns wake only enough idle workers for ready jobs, plus owners
+/// of unfinished leases. Existing experiment campaigns retain eager continuation.
+fn workers_to_wake(
+    idle: &HashSet<ThreadId>,
+    context: &Value,
+    workers: &HashMap<ThreadId, usize>,
+) -> HashSet<ThreadId> {
+    if context.get("run_kind").and_then(Value::as_str) != Some("generic") {
+        return idle.clone();
+    }
+    let owners: HashSet<&str> = context
+        .get("active_leases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|lease| lease.get("owner").and_then(Value::as_str))
+        .collect();
+    let mut selected: HashSet<ThreadId> = idle
+        .iter()
+        .filter(|id| owners.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let pending_claims = workers
+        .keys()
+        .filter(|id| !idle.contains(*id) && !owners.contains(id.as_str()))
+        .count() as u64;
+    let ready = context
+        .get("ready_work_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_sub(pending_claims);
+    selected.extend(
+        idle.iter()
+            .filter(|id| !owners.contains(id.as_str()))
+            .take(ready.min(idle.len() as u64) as usize)
+            .cloned(),
+    );
+    selected
 }
 
 /// Run real Infinity workers until the campaign stops or `shutdown` resolves.
@@ -151,6 +206,19 @@ pub async fn run_campaign(
             tool_operations_this_process: 0,
         });
     }
+    let generic_campaign = context.get("run_kind").and_then(Value::as_str) == Some("generic");
+    if generic_campaign {
+        let lease_seconds = context
+            .get("budget")
+            .and_then(|limits| limits.get("lease_seconds"))
+            .and_then(Value::as_f64)
+            .ok_or("generic campaign must provide budget.lease_seconds")?;
+        if lease_seconds <= options.poll_interval.as_secs_f64() * 3.0 + 5.0 {
+            return Err(
+                "generic lease_seconds must exceed three poll intervals plus five seconds".into(),
+            );
+        }
+    }
     let max_workers = positive_limit(&context, "max_workers")?;
     if options.workers as u64 > max_workers {
         return Err(format!(
@@ -176,14 +244,20 @@ pub async fn run_campaign(
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         let activity = Arc::new(ToolActivity::default());
+        let tools = campaign_tools(&context, backend.clone(), activity.clone())?;
+        let prompt = if context.get("run_kind").and_then(Value::as_str) == Some("generic") {
+            include_str!("generic_worker_prompt.md")
+        } else {
+            include_str!("worker_prompt.md")
+        };
         let mut system = AgentSystemBuilder::new_local(
             InMemoryConversationStore::new(),
             InMemoryStateStore::new(),
             model,
         )
         .without_builtin_tools()
-        .tools(research_tools(backend.clone(), activity.clone()))
-        .extra_system_prompt(include_str!("worker_prompt.md"))
+        .tools(tools)
+        .extra_system_prompt(prompt)
         .start();
         let sender = system.sender();
         let mut worker_ids = HashMap::<ThreadId, usize>::new();
@@ -194,7 +268,13 @@ pub async fn run_campaign(
             let mut handle = system.thread_builder().launch().await;
             let id = handle.thread_id().to_owned();
             worker_ids.insert(id.clone(), index);
-            handle.send_user_text(continuation_prompt(index, options.workers, &context)).await?;
+            let start_now = context.get("run_kind").and_then(Value::as_str) != Some("generic")
+                || (index as u64) < context.get("ready_work_count").and_then(Value::as_u64).unwrap_or(0);
+            if start_now {
+                handle.send_user_text(continuation_prompt(index, options.workers, &context)).await?;
+            } else {
+                idle.insert(id.clone());
+            }
             let events_tx = events_tx.clone();
             event_tasks.push(tokio::task::spawn_local(async move {
                 while let Some(event) = handle.recv().await {
@@ -243,7 +323,26 @@ pub async fn run_campaign(
                 }
                 _ = ticker.tick() => {
                     if !provider.is_stopping() {
-                        match backend.call("context", json!({})).await {
+                        // A model may think longer than one work lease. Renew
+                        // leases for live native owners before polling expiry;
+                        // model-call deadlines still bound a hung provider.
+                        while let Some(Some(event)) = system.next_lifecycle_event().now_or_never() {
+                            if worker_ids.contains_key(&event.thread_id) {
+                                match event.state {
+                                    ThreadLifecycleState::Live => { idle.remove(&event.thread_id); }
+                                    ThreadLifecycleState::Idle => { idle.insert(event.thread_id); }
+                                }
+                            }
+                        }
+                        let current = async {
+                            if generic_campaign {
+                                let owners: Vec<&str> = worker_ids.keys()
+                                    .filter(|id| !idle.contains(*id)).map(ThreadId::as_str).collect();
+                                backend.call("heartbeat", json!({"owners": owners})).await?;
+                            }
+                            backend.call("context", json!({})).await
+                        }.await;
+                        match current {
                             Ok(current) => match stop_reason(&current) {
                                 Ok(Some(reason)) => provider.stop(reason),
                                 Ok(None) => {
@@ -259,7 +358,8 @@ pub async fn run_campaign(
                                             }
                                         }
                                     }
-                                    for thread_id in idle.drain() {
+                                    for thread_id in workers_to_wake(&idle, &current, &worker_ids) {
+                                        idle.remove(&thread_id);
                                         let index = worker_ids[&thread_id];
                                         let input = InputMessage::user_text(thread_id, continuation_prompt(index, options.workers, &current));
                                         if let Err(error) = sender.send_to_input_queue(input, &uuid::Uuid::new_v4().to_string()).await {
@@ -284,6 +384,10 @@ pub async fn run_campaign(
                         }
                     }
                 }
+            }
+            if let Some(error) = activity.failure() {
+                provider.stop(error.clone());
+                fatal_error.get_or_insert(error);
             }
             if provider.is_stopping()
                 && activity.active() == 0

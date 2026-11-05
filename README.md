@@ -24,7 +24,7 @@ Between turns, an agent is pure data, just its conversation history with no task
 
 ## Learn More
 
-- **[Autonomous Research](research/README.md)**: This fork adds native Infinity research workers, durable experiment budgets and evidence, isolated candidate execution, and a Solar Filament Segmentation 2026 competition adapter. Start with the offline smoke test or configure a bounded Kaggle campaign.
+- **[Autonomous Research](research/README.md)**: This fork adds a generic durable work graph, native workers, dynamically registered tools, pinned on-demand skills, and isolated Python execution with independent geometric checking. The original Solar Filament competition campaign remains available as a specialized adapter. Start with the [generic examples](research/examples/generic-research/README.md) or the offline competition smoke test.
 
 - **[Infinity Runtime](https://infinity.hydro.run/docs/infinity-runtime/overview)**: Build your first agent with the [quickstart](https://infinity.hydro.run/docs/infinity-runtime/quickstart/launching-your-first-agent), see how yielding turns and hibernation work in the [architecture guide](https://infinity.hydro.run/docs/infinity-runtime/architecture), and [deploy on AWS Lambda](https://infinity.hydro.run/docs/infinity-runtime/serverless/quickstart) with the included CDK constructs.
 

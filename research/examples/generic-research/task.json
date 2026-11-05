@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "task_id": "exact-small-square-constructions",
+  "goal": "Find exact feasible unit-square packings for n=4 and n=5. Split independent construction and review work when useful. Use the available exact checker for every claimed layout, retain its effect IDs and artifacts, and distinguish an upper bound from an optimality proof. The checker accepts a+b*sqrt(2) coefficients; this task is not a Kaggle submission. For n=5, a four-corner-plus-rotated-center construction is a useful initial route. Report unresolved optimality explicitly.",
+  "capabilities": ["verify_square_packing"],
+  "capability_config": {
+    "verify_square_packing": {"max_n": 64, "max_rational_chars": 64}
+  },
+  "skills": ["research-decomposition", "geometric-packing", "counterexample-search", "evidence-review", "reproduce-result"],
+  "limits": {
+    "max_workers": 100,
+    "max_parallel_tools": 8,
+    "max_model_calls": 100000,
+    "max_output_tokens": 16384,
+    "max_wall_seconds": 86400,
+    "max_work_items": 10000,
+    "max_failures": 4,
+    "lease_seconds": 300
+  }
+}

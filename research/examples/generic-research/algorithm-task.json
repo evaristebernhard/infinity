@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "task_id": "compare-integer-partition-algorithms",
+  "goal": "Implement and compare at least two algorithms for counting integer partitions. Define the input convention, check exact counts on small cases using an independent implementation, then measure larger cases in the provided Python environment. Preserve full source, inputs, outputs and reproducible timing conditions. Do not claim a general correctness proof from finite test agreement. Split implementation, differential testing and performance analysis into useful work items, and produce a final report with evidence references.",
+  "capabilities": ["run_python"],
+  "capability_config": {
+    "run_python": {
+      "executor": {
+        "kind": "docker",
+        "image": "infinity-generic-python:local",
+        "cpus": 1,
+        "memory_mb": 1024,
+        "max_output_mb": 16
+      },
+      "max_timeout_seconds": 300,
+      "max_input_bytes": 262144,
+      "max_result_bytes": 65536,
+      "max_artifacts": 64
+    }
+  },
+  "skills": ["research-decomposition", "solver-improvement", "experiment-design", "code-debugging", "evidence-review", "reproduce-result", "strategy-evolution"],
+  "limits": {
+    "max_workers": 100,
+    "max_parallel_tools": 8,
+    "max_model_calls": 100000,
+    "max_output_tokens": 16384,
+    "max_wall_seconds": 86400,
+    "max_work_items": 10000,
+    "max_failures": 4,
+    "lease_seconds": 300
+  }
+}

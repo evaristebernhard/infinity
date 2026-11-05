@@ -93,6 +93,13 @@ jobs:
         with:
           tool: jj-cli
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install research bridge dependencies
+        run: python -m pip install -e './research'
+
       - name: Run tests
         run: cargo test --all-targets
 

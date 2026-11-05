@@ -139,7 +139,7 @@ impl PythonBackend {
     async fn timeout_for(&self, operation: &str, arguments: &Value) -> Result<Duration, BoxError> {
         match operation {
             "recover" => Ok(self.recovery_timeout),
-            "experiment" | "finalize" => {
+            "experiment" | "finalize" | "invoke_tool" => {
                 if operation == "experiment" {
                     arguments
                         .get("timeout_seconds")
@@ -178,9 +178,8 @@ impl PythonBackend {
                     .checked_add(self.experiment_grace)
                     .ok_or_else(|| "campaign wall timeout is too large".into())
             }
-            "context" | "finding" | "candidate" | "reserve_model_call" | "record_usage" => {
-                Ok(self.control_timeout)
-            }
+            "context" | "finding" | "candidate" | "reserve_model_call" | "record_usage"
+            | "heartbeat" | "interrupt_tool" => Ok(self.control_timeout),
             _ => Err(format!("unsupported research operation: {operation}").into()),
         }
     }

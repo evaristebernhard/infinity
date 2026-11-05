@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Durable experiment and evidence backend for Infinity research agents"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
-dependencies = []
+dependencies = ["PyYAML>=6.0.2,<7"]
 
 [project.optional-dependencies]
 filament = ["numpy>=1.26,<3", "Pillow>=10,<13", "pycocotools>=2.0.7,<3"]
@@ -18,3 +18,7 @@ infinity-research-task = "infinity_research.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["infinity_research*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+infinity_research = ["builtin_skills/*/SKILL.md", "builtin_skills/*/references/*.md"]
